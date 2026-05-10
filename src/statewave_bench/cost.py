@@ -22,8 +22,11 @@ from dataclasses import dataclass
 
 PRICES_PER_MILLION_TOKENS: dict[str, tuple[float, float]] = {
     # model_name : (input_price, output_price)
-    "claude-3-5-sonnet-20241022": (3.00, 15.00),
-    "claude-3-5-haiku-20241022": (0.80, 4.00),
+    # Claude 4.x family — current default lineup.
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-opus-4-7": (15.00, 75.00),
+    "claude-haiku-4-5-20251001": (0.80, 4.00),
+    # OpenAI judge models.
     "gpt-4o-2024-08-06": (2.50, 10.00),
     "gpt-4o-mini": (0.15, 0.60),
 }

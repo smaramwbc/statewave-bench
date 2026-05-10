@@ -73,7 +73,7 @@ LoCoMo's full dataset is **10 conversations × ~199 questions = ~1,986 questions
 - 1 answer call (~3K input + ~256 output tokens on Sonnet ≈ $0.013)
 - 1 judge call only for `open_domain` questions (~500 input + 8 output on GPT-4o ≈ $0.001)
 
-Approximate costs on Claude 3.5 Sonnet + GPT-4o judge, January 2026 prices:
+Approximate costs on Claude Sonnet 4.6 + GPT-4o judge, January 2026 prices:
 
 | Run scope | Question-runs | Estimated cost |
 |---|---:|---:|
@@ -114,7 +114,7 @@ We report scores per-category alongside the overall mean — a system that crush
 
 ### Fairness controls
 
-- **Same answer model across systems.** Whichever model the operator chooses (default: Claude 3.5 Sonnet at temp=0), every system uses it for the final answer. A system can't win because it picked a stronger model.
+- **Same answer model across systems.** Whichever model the operator chooses (default: Claude Sonnet 4.6 at temp=0), every system uses it for the final answer. A system can't win because it picked a stronger model.
 - **Same judge model across systems.** Same logic.
 - **Internal LLM costs reported separately.** Systems that issue their own LLM calls during ingest (Mem0's fact extractor, Statewave's optional LLM compiler) report those tokens under `internal_input_tokens` / `internal_output_tokens` so the operator sees the full bill, not just the answer-model cost.
 - **Per-conversation isolation.** Every system scopes its memory by conversation id (`bench:locomo:<id>` for Statewave/Mem0, `bench-locomo-<id>` for Zep). No cross-conversation leakage.

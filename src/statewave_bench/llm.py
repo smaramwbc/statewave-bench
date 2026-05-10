@@ -34,7 +34,7 @@ from typing import Literal
 # Switch providers by changing the model string — the client
 # auto-routes by name prefix.
 
-DEFAULT_ANSWER_MODEL = "claude-3-5-sonnet-20241022"
+DEFAULT_ANSWER_MODEL = "claude-sonnet-4-6"
 DEFAULT_JUDGE_MODEL = "gpt-4o-2024-08-06"
 
 

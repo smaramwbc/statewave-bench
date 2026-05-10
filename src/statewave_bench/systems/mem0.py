@@ -191,12 +191,15 @@ class Mem0System(MemorySystem):
         return None
 
     def health_check(self) -> HealthResult:
-        # Cheap read on a guaranteed-empty user_id. Cloud + self-hosted
-        # both support this; a reachable Mem0 returns an empty result
-        # rather than 404, so the absence of an exception is the
-        # success signal. Auth failures (bad MEM0_API_KEY) raise here.
+        # Cheap read on a guaranteed-empty user_id. Mem0 v2 cloud API
+        # rejects top-level entity kwargs on get_all — `filters={...}`
+        # with `version="v2"` is the supported shape. Self-hosted Memory
+        # ignores version; same call works on both.
         try:
-            self._client.get_all(user_id="bench-health-probe-nonexistent")
+            self._client.get_all(
+                filters={"user_id": "bench-health-probe-nonexistent"},
+                version="v2",
+            )
             return HealthResult(ok=True, detail="ok")
         except Exception as e:
             return HealthResult(ok=False, detail=_short(e))
