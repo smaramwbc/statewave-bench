@@ -126,13 +126,36 @@ class StatewaveSystem(MemorySystem):
 
         # Compile synchronously — every question wants compiled
         # memory, so the bench can't proceed until it lands. We use
-        # the wait-for-completion path with a generous timeout; if a
-        # conversation takes longer than 60s to compile, the bench
-        # falls through to whatever's been compiled so far. Questions
-        # might score lower than with a full compile; that's reported
-        # honestly in the results, not papered over.
-        with contextlib.suppress(TimeoutError):
-            self._client.compile_memories_wait(subject_id, timeout=COMPILE_TIMEOUT_SEC)
+        # the wait-for-completion path with a generous timeout.
+        #
+        # `compile_memories_wait` returns a CompileJob with .status of
+        # "completed" or "failed" (the SDK only raises on timeout).
+        # Surface both failure modes AND a zero-memories-on-completed
+        # result — the latter is what bit conv-26 silently: 19 episodes
+        # ingested, 0 memories produced, every answer call ran against
+        # an empty context, but the bench never said anything.
+        from ..runner import console
+
+        try:
+            job = self._client.compile_memories_wait(subject_id, timeout=COMPILE_TIMEOUT_SEC)
+        except TimeoutError:
+            console.print(
+                f"[yellow]statewave compile timeout for {subject_id}[/] — "
+                f"falling through with whatever's compiled so far."
+            )
+            return
+        if job.status != "completed":
+            console.print(
+                f"[red]statewave compile failed for {subject_id}[/] "
+                f"(job_id={job.job_id}, status={job.status}, error={job.error!r})"
+            )
+        elif job.memories_created == 0:
+            console.print(
+                f"[yellow]statewave compile produced 0 memories for {subject_id}[/] "
+                f"(job_id={job.job_id}) — answers will run against an empty bundle. "
+                f"Check server-side compiler config (heuristic vs LLM, API keys, "
+                f"min-evidence thresholds)."
+            )
 
     def answer(self, conversation_id: str, question: str) -> AnswerResult:
         subject_id = _subject_for(conversation_id)
