@@ -47,8 +47,11 @@ $EDITOR .env
 # 3. Verify each system is reachable (no billable LLM calls).
 uv run swb config-check
 
-# 4. Pilot run — caps at 50 conversations, ~$50 in API costs.
-uv run swb run --limit 50
+# 4. Smoke run — one conversation across all 5 systems, ~$10–$15.
+uv run swb run --limit 1
+
+# Or full set when you're ready: 10 conversations, ~$100–$150 total.
+# uv run swb run
 
 # 5. Render the summary + charts.
 uv run swb report
@@ -64,29 +67,43 @@ uv run swb report
 - Every question's `answer` call (the shared LLM the bench fixes for fair comparison)
 - Every LLM-as-judge call on open-ended questions (a separate model scores answers)
 
-Approximate costs on Claude 3.5 Sonnet + GPT-4o-judge, January 2026 prices:
+LoCoMo's full dataset is **10 conversations × ~199 questions = ~1,986 questions per system**. The bench runs every question through every system, so 5 systems × 1,986 questions = ~9,930 question-runs total. Per question we make:
 
-| Run scope | LLM calls | Estimated cost |
+- 1 retrieval call (free for the bench's accounting — Mem0 / Zep handle internally; Statewave runs locally)
+- 1 answer call (~3K input + ~256 output tokens on Sonnet ≈ $0.013)
+- 1 judge call only for `open_domain` questions (~500 input + 8 output on GPT-4o ≈ $0.001)
+
+Approximate costs on Claude 3.5 Sonnet + GPT-4o judge, January 2026 prices:
+
+| Run scope | Question-runs | Estimated cost |
 |---|---:|---:|
-| Pilot (50 conversations) | ~6,000 | $40–$80 |
-| Full set (~600 conversations) | ~70,000 | $300–$600 |
-| Full set + GPT-4o cross-validation | ~140,000 | $700–$1,200 |
+| Smoke (1 conversation, all 5 systems) | ~995 | $10–$15 |
+| Pilot (3 conversations) | ~2,985 | $30–$45 |
+| Full set (10 conversations) | ~9,930 | $100–$150 |
 
-Plus per-system fees: Mem0 cloud free tier covers the pilot; Zep cloud free tier covers the pilot. Statewave's cost is just your own infrastructure (Postgres + the Statewave server, both self-hosted).
+Plus internal LLM costs the bench doesn't directly observe:
 
-**Always run the pilot first** — `swb run --limit 50` — so you confirm the harness works on your environment before committing to the full spend.
+- **Mem0** runs its own fact-extraction LLM call on every `add()` against the operator's OpenAI / Anthropic key — about $4–$8 across the full set
+- **Statewave with the LLM compiler** runs one compile per conversation (~$0.05 each, ~$0.50 total). Statewave with the heuristic compiler is $0
+- **Zep** bills graph-build LLM calls against the Zep plan, not against an external provider key — see Zep's pricing page
+
+Mem0 cloud + Zep cloud free tiers cover the smoke + pilot runs. Statewave's cost is just your own infrastructure (Postgres + the Statewave server, both self-hosted).
+
+**Always run the smoke first** — `swb run --limit 1` — so you confirm the harness works on your environment before committing to the full spend.
 
 ## Methodology
 
 ### Dataset
 
-[LoCoMo](https://github.com/snap-research/LoCoMo) — ~600 multi-session conversations from Snap Research's 2024 paper *"Evaluating Very Long-Term Conversational Memory of LLM Agents."* Each conversation has 5+ sessions over a simulated multi-week timeframe, plus questions categorized as:
+[LoCoMo](https://github.com/snap-research/LoCoMo) — 10 multi-session conversations from Snap Research's 2024 paper *"Evaluating Very Long-Term Conversational Memory of LLM Agents."* Each conversation has ~19 sessions over ~6 months simulated time, totaling ~600 turns and ~199 categorized recall questions. The bench fetches the canonical `data/locomo10.json` directly from the upstream GitHub repo (cached locally on first use).
 
-- `single_session` — answer lives in one session
-- `multi_session` — answer requires combining facts across sessions
-- `temporal_reasoning` — answer requires reasoning about *when* things happened
-- `open_domain` — answer is open-ended, not exact-match
-- `adversarial` — questions designed to surface confabulation
+Categories per the paper's Table 1:
+
+- `single_hop` (code 1) — answer lives in one utterance
+- `multi_hop` (code 2) — answer requires combining facts from multiple utterances or sessions
+- `temporal` (code 3) — answer requires reasoning about *when* things happened
+- `open_domain` (code 4) — answer is open-ended; scored via LLM-as-judge instead of F1
+- `adversarial` (code 5) — answer isn't in the conversation at all; the model should refuse
 
 We report scores per-category alongside the overall mean — a system that crushes single-session questions but bombs multi-session ones shouldn't get to hide that under one global number.
 
