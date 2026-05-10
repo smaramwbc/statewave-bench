@@ -103,9 +103,7 @@ def _write_markdown_summary(
         "| System | Mean score | n | Avg input tok / q | Avg output tok / q | "
         "Median latency (s) | p95 latency (s) |"
     )
-    lines.append(
-        "|---|---:|---:|---:|---:|---:|---:|"
-    )
+    lines.append("|---|---:|---:|---:|---:|---:|---:|")
     for row in overall.iter_rows(named=True):
         n = row["n_questions"] or 1
         lines.append(

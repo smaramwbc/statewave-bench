@@ -26,7 +26,6 @@ from ..dataset import LocomoConversation, LocomoTurn
 from ..llm import LlmClient, resolve_answer_model
 from .base import AnswerResult, MemorySystem
 
-
 # Tunable: how many turns to keep. 100 is a deliberately permissive
 # floor — it gives the naive baseline a fair shot at single-session
 # questions while still failing on multi-session ones (LoCoMo
@@ -43,16 +42,12 @@ class NaiveSystem(MemorySystem):
         # Per-conversation rolling window. We index by `conversation.id`
         # so the bench can interleave conversations across runs without
         # cross-contamination.
-        self._windows: dict[str, deque[LocomoTurn]] = defaultdict(
-            lambda: deque(maxlen=window_size)
-        )
+        self._windows: dict[str, deque[LocomoTurn]] = defaultdict(lambda: deque(maxlen=window_size))
 
     def ingest(self, conversation: LocomoConversation) -> None:
         window = self._windows[conversation.id]
         window.clear()
-        window.extend(
-            turn for session in conversation.sessions for turn in session
-        )
+        window.extend(turn for session in conversation.sessions for turn in session)
 
     def answer(self, conversation_id: str, question: str) -> AnswerResult:
         window = self._windows.get(conversation_id) or deque()

@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 from rich.console import Console
 
 from .dataset import load_locomo
-
+from .systems.base import MemorySystem
 
 console = Console()
 
@@ -60,7 +60,7 @@ def config_check(systems: tuple[str, ...]) -> None:
         try:
             _ = _instantiate_system(name)
             console.print(f"[green]✓[/] {name}: ready")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             console.print(f"[red]✗[/] {name}: {e}")
             problems.append(name)
 
@@ -112,15 +112,13 @@ def run(
     for name in requested:
         try:
             instances.append(_instantiate_system(name))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             console.print(f"[red]Skipping {name}:[/] {e}")
     if not instances:
         console.print("[red]No systems instantiated. Aborting.[/]")
         sys.exit(2)
 
-    console.print(
-        f"Running {len(instances)} system(s): {', '.join(s.name for s in instances)}"
-    )
+    console.print(f"Running {len(instances)} system(s): {', '.join(s.name for s in instances)}")
     if limit:
         console.print(f"[yellow]Pilot mode:[/] capping at {limit} conversations.")
 
@@ -161,7 +159,7 @@ def _all_system_names() -> list[str]:
     return ["statewave", "mem0", "zep", "naive", "no_memory"]
 
 
-def _instantiate_system(name: str) -> object:
+def _instantiate_system(name: str) -> MemorySystem:
     """Lazy per-system import so an operator running only `naive`
     + `no_memory` doesn't have to install Mem0 or Zep SDKs."""
     if name == "statewave":
@@ -184,9 +182,7 @@ def _instantiate_system(name: str) -> object:
         from .systems.no_memory import NoMemorySystem
 
         return NoMemorySystem()
-    raise ValueError(
-        f"Unknown system `{name}`. Known: {', '.join(_all_system_names())}"
-    )
+    raise ValueError(f"Unknown system `{name}`. Known: {', '.join(_all_system_names())}")
 
 
 # Silence unused-import warnings for `os`, `Path` if any subcommand
