@@ -77,11 +77,10 @@ class Mem0System(MemorySystem):
         user_id = _user_id_for(conversation.id)
 
         # Idempotency: clear prior memories for this user_id before
-        # ingesting. The cloud SDK's delete_all(user_id=...) does this
-        # in one call; the self-hosted SDK has the same shape. Empty
-        # subject (404) is fine; other errors surface on the next call.
+        # ingesting. 404 / empty-subject is fine; other errors surface
+        # on the next call.
         with contextlib.suppress(Exception):
-            self._client.delete_all(user_id=user_id)
+            self._delete_all(user_id)
 
         # Mem0 takes message lists in OpenAI-style {role, content}
         # shape. We feed every session as one batch so Mem0's fact
@@ -100,8 +99,8 @@ class Mem0System(MemorySystem):
                 for turn in session
             ]
             try:
-                self._client.add(
-                    messages,
+                self._add(
+                    messages=messages,
                     user_id=user_id,
                     metadata={
                         "session_id": session_idx,
@@ -125,11 +124,7 @@ class Mem0System(MemorySystem):
         start = time.perf_counter()
 
         # Step 1: retrieve memories.
-        search_result = self._client.search(
-            question,
-            user_id=user_id,
-            top_k=DEFAULT_TOP_K,
-        )
+        search_result = self._search(query=question, user_id=user_id, top_k=DEFAULT_TOP_K)
 
         # The SDK returns either {"results": [...]} (cloud v2 shape)
         # or just [...] (older / self-hosted). Handle both.
@@ -191,18 +186,72 @@ class Mem0System(MemorySystem):
         return None
 
     def health_check(self) -> HealthResult:
-        # Cheap read on a guaranteed-empty user_id. Mem0 v2 cloud API
-        # rejects top-level entity kwargs on get_all — `filters={...}`
-        # with `version="v2"` is the supported shape. Self-hosted Memory
-        # ignores version; same call works on both.
+        # Cheap read on a guaranteed-empty user_id. Routes through the
+        # same v2-aware helper as the real ingest/answer paths so the
+        # probe fails the same way the runner would.
         try:
-            self._client.get_all(
-                filters={"user_id": "bench-health-probe-nonexistent"},
-                version="v2",
-            )
+            self._get_all(user_id="bench-health-probe-nonexistent")
             return HealthResult(ok=True, detail="ok")
         except Exception as e:
             return HealthResult(ok=False, detail=_short(e))
+
+    # ── Cloud-vs-self-hosted shims ────────────────────────────────────────
+    # Mem0 v2's cloud `MemoryClient` rejects top-level entity kwargs
+    # (`user_id=`); identity fields move into `filters={...}`. The
+    # self-hosted `Memory` class kept the old signatures for write
+    # methods (`add`, `delete_all`) but adopted `filters=` for reads
+    # (`search`, `get_all`). These four helpers branch on `self._cloud`
+    # so the caller code stays clean.
+
+    def _add(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        user_id: str,
+        metadata: dict[str, object],
+    ) -> object:
+        if self._cloud:
+            from mem0.client.types import AddMemoryOptions
+
+            return self._client.add(
+                messages,
+                options=AddMemoryOptions(
+                    filters={"user_id": user_id},
+                    metadata=metadata,
+                ),
+            )
+        return self._client.add(messages, user_id=user_id, metadata=metadata)
+
+    def _search(self, *, query: str, user_id: str, top_k: int) -> object:
+        if self._cloud:
+            from mem0.client.types import SearchMemoryOptions
+
+            return self._client.search(
+                query,
+                options=SearchMemoryOptions(
+                    filters={"user_id": user_id},
+                    top_k=top_k,
+                ),
+            )
+        return self._client.search(query, top_k=top_k, filters={"user_id": user_id})
+
+    def _get_all(self, *, user_id: str) -> object:
+        if self._cloud:
+            from mem0.client.types import GetAllMemoryOptions
+
+            return self._client.get_all(
+                options=GetAllMemoryOptions(filters={"user_id": user_id}),
+            )
+        return self._client.get_all(filters={"user_id": user_id})
+
+    def _delete_all(self, user_id: str) -> object:
+        if self._cloud:
+            from mem0.client.types import DeleteAllMemoryOptions
+
+            return self._client.delete_all(
+                options=DeleteAllMemoryOptions(filters={"user_id": user_id}),
+            )
+        return self._client.delete_all(user_id=user_id)
 
 
 def _short(err: object) -> str:
