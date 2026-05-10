@@ -1,0 +1,107 @@
+# Single Python project, uv-managed. Run `uv sync` to materialize the
+# lockfile-pinned environment, `uv run swb …` to execute the harness.
+#
+# Why uv over pip / poetry: it's the modern, fast, lockfile-correct
+# choice that the AI-tooling ecosystem has converged on (Mem0, Letta,
+# vLLM, dspy all ship uv-based projects). Lower friction for
+# contributors who want to reproduce the bench.
+
+[project]
+name = "statewave-bench"
+version = "0.1.0"
+description = "Open benchmark for AI memory runtimes — Statewave vs Mem0 vs Zep on LoCoMo."
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Statewave", email = "hello@statewave.ai" }]
+requires-python = ">=3.11"
+keywords = [
+  "statewave", "benchmark", "memory", "llm", "agent",
+  "locomo", "mem0", "zep", "evaluation",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+  # Dataset + I/O
+  "datasets>=2.20",         # loads LoCoMo from HuggingFace
+  "pydantic>=2.7",          # typed config + result records
+  "rich>=13.7",             # progress bars + result tables in the terminal
+  "click>=8.1",             # CLI entry point
+  "tomli>=2.0; python_version < '3.11'",
+  "python-dotenv>=1.0",     # loads .env for API keys
+
+  # LLM clients — provider-specific, used by both the systems-under-test
+  # and (later) the LLM-as-judge metric.
+  "anthropic>=0.40",
+  "openai>=1.50",
+
+  # Memory systems we benchmark against. Mem0 + Zep ship Python SDKs;
+  # Statewave goes through statewave-py. naive + no-memory baselines
+  # need no extra deps.
+  #
+  # We pin floors not ceilings — freezing the exact versions used for
+  # the published run goes in uv.lock, which is committed.
+  "mem0ai>=0.1.30",
+  "zep-cloud>=2.0",
+  "statewave>=0.6",         # Python SDK; reads STATEWAVE_URL + STATEWAVE_API_KEY
+
+  # Result reporting + charts
+  "polars>=1.0",            # results dataframe; faster + simpler API than pandas
+  "altair>=5.4",            # Vega-Lite charts; HTML output ready for embedding
+]
+
+[project.optional-dependencies]
+# `uv sync --extra dev` to install dev tooling.
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.6",
+  "mypy>=1.10",
+  "types-requests",
+]
+
+[project.scripts]
+# `uv run swb <command>` — the harness CLI.
+swb = "statewave_bench.cli:main"
+
+[project.urls]
+Homepage = "https://statewave.ai"
+Repository = "https://github.com/smaramwbc/statewave-bench"
+Issues = "https://github.com/smaramwbc/statewave/issues"
+
+# ── Build system ──────────────────────────────────────────────────────────
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/statewave_bench"]
+
+# ── Tooling ───────────────────────────────────────────────────────────────
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Focused lint rule set: errors, formatting hygiene, common bugs.
+# Skip the truly opinionated formatting rules — `ruff format` handles those.
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+# E501 (line too long) is enforced by `ruff format`, not the linter.
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
