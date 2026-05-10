@@ -23,7 +23,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 # Default Hugging Face dataset id. Override via `LOCOMO_DATASET_ID` env
 # var if Snap re-publishes elsewhere or you have a private fork (e.g.
 # for reproducibility-pinned snapshots).
@@ -96,7 +95,7 @@ def load_locomo(
     # Imported lazily so `import statewave_bench.cli` doesn't pay the
     # dataset-lib import cost (it's heavy and only relevant when an
     # actual run is happening).
-    from datasets import load_dataset  # type: ignore[import-untyped]
+    from datasets import load_dataset
 
     raw = load_dataset(
         dataset_id,
@@ -104,12 +103,10 @@ def load_locomo(
         cache_dir=str(cache_dir) if cache_dir else None,
     )
 
-    yielded = 0
-    for row in raw:
+    for yielded, row in enumerate(raw):
         if limit is not None and yielded >= limit:
             return
         yield _row_to_conversation(row)
-        yielded += 1
 
 
 def _row_to_conversation(row: dict[str, Any]) -> LocomoConversation:
@@ -121,10 +118,7 @@ def _row_to_conversation(row: dict[str, Any]) -> LocomoConversation:
     dropped on the floor.
     """
     sessions_raw = row.get("sessions") or []
-    sessions = tuple(
-        tuple(_turn(t) for t in (session or []))
-        for session in sessions_raw
-    )
+    sessions = tuple(tuple(_turn(t) for t in (session or [])) for session in sessions_raw)
     qa_raw = row.get("qa") or row.get("questions") or []
     qa = tuple(_qa(q) for q in qa_raw)
     return LocomoConversation(
