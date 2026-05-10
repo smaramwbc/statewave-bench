@@ -143,8 +143,10 @@ def _write_markdown_summary(
 
 
 def _write_overall_chart(*, overall: pl.DataFrame, out: Path) -> None:
+    # Altair 5.4+ accepts polars DataFrames natively (via narwhals).
+    # No `.to_pandas()` round-trip — avoids dragging in pyarrow.
     chart = (
-        alt.Chart(overall.to_pandas())
+        alt.Chart(overall)
         .mark_bar()
         .encode(
             x=alt.X("mean_score:Q", title="Mean score (higher is better)"),
@@ -162,7 +164,7 @@ def _write_overall_chart(*, overall: pl.DataFrame, out: Path) -> None:
 
 def _write_by_category_chart(*, by_category: pl.DataFrame, out: Path) -> None:
     chart = (
-        alt.Chart(by_category.to_pandas())
+        alt.Chart(by_category)
         .mark_bar()
         .encode(
             x=alt.X("system:N", title=None),
