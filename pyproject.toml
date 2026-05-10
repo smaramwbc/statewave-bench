@@ -29,7 +29,9 @@ classifiers = [
 
 dependencies = [
   # Dataset + I/O
-  "datasets>=2.20",         # loads LoCoMo from HuggingFace
+  # LoCoMo is fetched directly from snap-research/LoCoMo's raw GitHub
+  # URL (it's not a HuggingFace dataset). Stdlib `urllib` handles the
+  # download, so no dataset library dep here.
   "pydantic>=2.7",          # typed config + result records
   "rich>=13.7",             # progress bars + result tables in the terminal
   "click>=8.1",             # CLI entry point
