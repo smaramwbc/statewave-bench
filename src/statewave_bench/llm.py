@@ -199,3 +199,131 @@ def resolve_answer_model() -> str:
 
 def resolve_judge_model() -> str:
     return os.environ.get("SWB_JUDGE_MODEL", DEFAULT_JUDGE_MODEL)
+
+
+# ── Live provider health checks ───────────────────────────────────────────
+#
+# Cost-trivial (1 generated token per provider, ~$0.0001 each) live
+# probes that catch the failure modes that would otherwise blow up
+# mid-bench: missing keys, wrong keys, exhausted balance, region
+# restrictions. Run via `swb config-check`.
+
+
+@dataclass(frozen=True)
+class ProviderCheck:
+    """Outcome of one live provider probe."""
+
+    provider: str
+    model: str
+    ok: bool
+    detail: str
+    # Tokens billed by the probe itself (1-token max generation). Surfaced
+    # so the cost-estimator can add it to the total when reporting.
+    probe_input_tokens: int = 0
+    probe_output_tokens: int = 0
+
+
+def check_anthropic_live(client: LlmClient | None = None) -> ProviderCheck:
+    """Hit Anthropic with a 1-token generation against the answer
+    model. Distinguishes missing-key (config_error) from low-balance
+    (invalid_request_error w/ specific message) so the operator sees
+    exactly what to fix."""
+    model = resolve_answer_model()
+    if _provider_for(model) != "anthropic":
+        return ProviderCheck(
+            provider="anthropic",
+            model=model,
+            ok=True,
+            detail="(answer model is not Anthropic — skipped)",
+        )
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return ProviderCheck(
+            provider="anthropic",
+            model=model,
+            ok=False,
+            detail="ANTHROPIC_API_KEY not set",
+        )
+    c = client or LlmClient()
+    try:
+        result = c.complete(
+            model=model,
+            system=None,
+            user="hi",
+            max_tokens=1,
+            temperature=0.0,
+        )
+        return ProviderCheck(
+            provider="anthropic",
+            model=model,
+            ok=True,
+            detail="ok",
+            probe_input_tokens=result.input_tokens,
+            probe_output_tokens=result.output_tokens,
+        )
+    except Exception as e:
+        return ProviderCheck(
+            provider="anthropic",
+            model=model,
+            ok=False,
+            detail=_short_error(e),
+        )
+
+
+def check_openai_live(client: LlmClient | None = None) -> ProviderCheck:
+    """Hit OpenAI with a 1-token generation against the judge model.
+    Same distinction surface as Anthropic: missing key vs. quota
+    exhausted vs. wrong project."""
+    model = resolve_judge_model()
+    if _provider_for(model) != "openai":
+        return ProviderCheck(
+            provider="openai",
+            model=model,
+            ok=True,
+            detail="(judge model is not OpenAI — skipped)",
+        )
+    if not os.environ.get("OPENAI_API_KEY"):
+        return ProviderCheck(
+            provider="openai",
+            model=model,
+            ok=False,
+            detail="OPENAI_API_KEY not set",
+        )
+    c = client or LlmClient()
+    try:
+        result = c.complete(
+            model=model,
+            system=None,
+            user="hi",
+            max_tokens=1,
+            temperature=0.0,
+        )
+        return ProviderCheck(
+            provider="openai",
+            model=model,
+            ok=True,
+            detail="ok",
+            probe_input_tokens=result.input_tokens,
+            probe_output_tokens=result.output_tokens,
+        )
+    except Exception as e:
+        return ProviderCheck(
+            provider="openai",
+            model=model,
+            ok=False,
+            detail=_short_error(e),
+        )
+
+
+def _short_error(err: object) -> str:
+    """Compress an SDK error into a one-line summary fit for a
+    table cell. SDK exceptions carry useful body text (e.g. Anthropic's
+    'credit balance is too low') but the full repr is multi-line and
+    full of request_ids the operator doesn't need to see in the
+    summary view."""
+    s = str(err)
+    # Trim very long messages — operators can re-run with verbose
+    # for the full thing if needed.
+    if len(s) > 200:
+        s = s[:200] + "…"
+    # Replace newlines so the table cell stays one line.
+    return s.replace("\n", " ")

@@ -41,6 +41,16 @@ from .systems.base import AnswerResult, MemorySystem
 
 console = Console()
 
+# Fast-fail circuit-breaker: if N consecutive `answer` calls fail for
+# the same (system, conversation), skip the rest of that conversation
+# for that system. Saves the operator from burning the whole question
+# set when a provider's API is down / out-of-balance / mis-keyed.
+#
+# 3 is conservative — one transient blip won't trip it; three in a
+# row almost always means systemic. The runner logs the abort so it's
+# visible in the JSONL trailer.
+FAILURE_STREAK_THRESHOLD = 3
+
 
 # ── Result records ────────────────────────────────────────────────────────
 
@@ -167,9 +177,32 @@ def run_bench(
                         progress.update(task, advance=len(conv.qa))
                         continue
 
-                # Per-question loop.
+                # Per-question loop. The failure streak counter resets
+                # at the start of every (system, conversation) pair —
+                # one system's dead API shouldn't kill the next system,
+                # and a conversation that's been completed for one
+                # system shouldn't poison the next conversation.
+                failure_streak = 0
+                aborted_for_streak = False
                 for q_idx, qa in enumerate(conv.qa):
                     if (system.name, conv.id, q_idx) in already_done:
+                        progress.update(task, advance=1)
+                        continue
+                    if failure_streak >= FAILURE_STREAK_THRESHOLD:
+                        # Skip the rest of this conversation for this
+                        # system. The runner already logged the
+                        # individual failures via _run_one_question;
+                        # surface the abort once here so the operator
+                        # sees the circuit-breaker fired without
+                        # scrolling through 200 identical errors.
+                        if not aborted_for_streak:
+                            console.print(
+                                f"[red]Aborting {system.name} / {conv.id}[/] "
+                                f"after {FAILURE_STREAK_THRESHOLD} consecutive "
+                                f"answer failures — skipping remaining "
+                                f"{len(conv.qa) - q_idx} questions for this pair."
+                            )
+                            aborted_for_streak = True
                         progress.update(task, advance=1)
                         continue
                     progress.update(
@@ -184,7 +217,10 @@ def run_bench(
                         judge_llm=judge_llm,
                         judge_model=judge_model,
                     )
-                    if record is not None:
+                    if record is None:
+                        failure_streak += 1
+                    else:
+                        failure_streak = 0  # one success resets the breaker
                         out_fh.write(json.dumps(record) + "\n")
                         out_fh.flush()
                     progress.update(task, advance=1)

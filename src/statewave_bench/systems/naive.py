@@ -24,7 +24,7 @@ from collections import defaultdict, deque
 
 from ..dataset import LocomoConversation, LocomoTurn
 from ..llm import LlmClient, resolve_answer_model
-from .base import AnswerResult, MemorySystem
+from .base import AnswerResult, HealthResult, MemorySystem
 
 # Tunable: how many turns to keep. 100 is a deliberately permissive
 # floor — it gives the naive baseline a fair shot at single-session
@@ -78,3 +78,10 @@ class NaiveSystem(MemorySystem):
 
     def reset(self) -> None:
         self._windows.clear()
+
+    def health_check(self) -> HealthResult:
+        # The naive baseline has no remote state — it just keeps a
+        # rolling deque in memory. The only thing that can fail at
+        # health-probe time is the LLM client itself, which the
+        # provider-level Anthropic/OpenAI checks already cover.
+        return HealthResult(ok=True, detail="(baseline — no remote state)")

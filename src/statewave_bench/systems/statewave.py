@@ -33,7 +33,7 @@ import time
 
 from ..dataset import LocomoConversation
 from ..llm import LlmClient, resolve_answer_model
-from .base import AnswerResult, MemorySystem
+from .base import AnswerResult, HealthResult, MemorySystem
 
 SUBJECT_PREFIX = "bench:locomo:"
 EPISODE_SOURCE = "statewave-bench"
@@ -184,3 +184,23 @@ class StatewaveSystem(MemorySystem):
         # The SDK doesn't currently expose a prefix-list helper, so
         # this stays a per-conversation cleanup in `ingest`.
         return None
+
+    def health_check(self) -> HealthResult:
+        # Cheap connectivity probe: get_timeline against a known-
+        # nonexistent subject. A reachable server returns an empty
+        # Timeline (or a clean 404 / Pydantic-validated payload, depending
+        # on server version) without burning compute. Anything else —
+        # auth failure, network unreachable, bad URL — surfaces as the
+        # exception we catch and report.
+        try:
+            self._client.get_timeline("bench:health-probe:nonexistent")
+            return HealthResult(ok=True, detail="ok")
+        except Exception as e:
+            return HealthResult(ok=False, detail=_short(e))
+
+
+def _short(err: object) -> str:
+    s = str(err)
+    if len(s) > 200:
+        s = s[:200] + "…"
+    return s.replace("\n", " ")

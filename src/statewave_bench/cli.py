@@ -22,7 +22,15 @@ import click
 from dotenv import load_dotenv
 from rich.console import Console
 
+from .cost import CostEstimate
+from .cost import estimate as estimate_cost
 from .dataset import load_locomo
+from .llm import (
+    check_anthropic_live,
+    check_openai_live,
+    resolve_answer_model,
+    resolve_judge_model,
+)
 from .systems.base import MemorySystem
 
 console = Console()
@@ -49,25 +57,151 @@ def main() -> None:
     multiple=True,
     help="Which systems to check (default: all). Example: -s statewave -s mem0",
 )
-def config_check(systems: tuple[str, ...]) -> None:
-    """Lightweight sanity check — verifies API keys are present and
-    importable for the requested systems. Does NOT make billable
-    LLM calls; just confirms the environment is wired."""
-    requested = set(systems) if systems else _all_system_names()
+@click.option(
+    "--limit",
+    type=int,
+    default=None,
+    help=(
+        "If set, also print a cost estimate for `swb run --limit <N>` "
+        "based on the requested systems. Use 1 for a smoke estimate, "
+        "10 for the full set."
+    ),
+)
+@click.option(
+    "--statewave-llm-compile",
+    is_flag=True,
+    default=False,
+    help=(
+        "Flag for the cost estimator: include Statewave's LLM compile "
+        "cost (operator's server is configured with the LLM compiler). "
+        "Default off (heuristic compiler, no external cost)."
+    ),
+)
+def config_check(
+    systems: tuple[str, ...],
+    limit: int | None,
+    statewave_llm_compile: bool,
+) -> None:
+    """End-to-end pre-flight: live API probes for every system + the
+    answer + judge models, then a cost estimate for the planned run.
+    Each provider probe costs ~$0.0001 (1-token generation); the
+    system probes are read-only and free.
 
+    Three failure modes the probes catch that bare instantiation
+    didn't:
+      - Wrong API key (auth_failure)
+      - Out of credits / quota (low-balance error)
+      - Cloud project misconfigured (region / model not enabled)
+    """
+    requested = list(systems) if systems else _all_system_names()
     problems: list[str] = []
+
+    # ── 1. Per-provider probes ─────────────────────────────────────────
+    # We always run these because every system uses the answer model
+    # for its final answer and (for open_domain questions) the judge
+    # model for scoring.
+    console.print("[bold]Providers:[/]")
+    anthropic = check_anthropic_live()
+    _print_check(anthropic.provider, anthropic.model, anthropic.ok, anthropic.detail)
+    if not anthropic.ok:
+        problems.append("anthropic")
+
+    openai = check_openai_live()
+    _print_check(openai.provider, openai.model, openai.ok, openai.detail)
+    if not openai.ok:
+        problems.append("openai")
+
+    # ── 2. Per-system probes ───────────────────────────────────────────
+    console.print("\n[bold]Systems:[/]")
     for name in requested:
         try:
-            _ = _instantiate_system(name)
-            console.print(f"[green]✓[/] {name}: ready")
+            instance = _instantiate_system(name)
         except Exception as e:
-            console.print(f"[red]✗[/] {name}: {e}")
+            _print_check(name, "—", False, _short_err(e))
+            problems.append(name)
+            continue
+        try:
+            health = instance.health_check()
+        except Exception as e:
+            _print_check(name, "—", False, _short_err(e))
+            problems.append(name)
+            continue
+        _print_check(name, "—", health.ok, health.detail)
+        if not health.ok:
             problems.append(name)
 
+    # ── 3. Cost estimate (optional) ─────────────────────────────────────
+    if limit is not None:
+        n_systems_for_estimate = len(requested)
+        # The estimator's Mem0 line only applies if mem0 is in the
+        # requested set; skip it when running baselines-only.
+        include_mem0 = "mem0" in requested
+        est = estimate_cost(
+            n_conversations=limit,
+            n_systems=n_systems_for_estimate,
+            answer_model=resolve_answer_model(),
+            judge_model=resolve_judge_model(),
+            include_mem0=include_mem0,
+            statewave_llm_compile=statewave_llm_compile,
+        )
+        _print_cost_estimate(est)
+
     if problems:
-        console.print(f"\n[red]{len(problems)} system(s) not ready:[/] {', '.join(problems)}")
+        console.print(
+            f"\n[red]✗ {len(problems)} probe(s) failed:[/] {', '.join(problems)}\n"
+            "Fix the issues above before running `swb run`."
+        )
         sys.exit(2)
-    console.print("\n[green]All requested systems ready.[/]")
+    console.print("\n[green]✓ All probes passed.[/]")
+
+
+def _print_check(name: str, model: str, ok: bool, detail: str) -> None:
+    icon = "[green]✓[/]" if ok else "[red]✗[/]"
+    model_suffix = f"  ({model})" if model and model != "—" else ""
+    console.print(f"  {icon} {name}{model_suffix}: {detail}")
+
+
+def _short_err(err: object) -> str:
+    s = str(err)
+    if len(s) > 200:
+        s = s[:200] + "…"
+    return s.replace("\n", " ")
+
+
+def _print_cost_estimate(est: CostEstimate) -> None:
+    """Format the cost estimate as a small terminal table. Operators
+    eyeball this against their API balances before kicking off a real
+    run."""
+    console.print(f"\n[bold]Cost estimate - `swb run --limit {est.n_conversations}`:[/]")
+    console.print(
+        f"  Scope:      {est.n_conversations} conversation(s) x {est.n_systems} system(s)"
+    )
+    console.print(f"  Answer model: {est.answer_model}")
+    console.print(f"  Judge model:  {est.judge_model}\n")
+
+    rows: list[tuple[str, str]] = [
+        (
+            "Anthropic (answer model)",
+            f"${est.anthropic_low:.2f} - ${est.anthropic_high:.2f}",
+        ),
+        (
+            "OpenAI (judge, ~35% of questions)",
+            f"${est.openai_judge_low:.2f}",
+        ),
+    ]
+    if est.openai_mem0_internal > 0:
+        rows.append(("OpenAI (Mem0 internal fact extractor)", f"${est.openai_mem0_internal:.2f}"))
+    if est.statewave_internal > 0:
+        rows.append(("OpenAI (Statewave LLM compile)", f"${est.statewave_internal:.2f}"))
+
+    width = max(len(label) for label, _ in rows)
+    for label, value in rows:
+        console.print(f"  {label.ljust(width)}  {value}")
+    console.print(
+        f"\n  [bold]Total:      ${est.total_low:.2f} - ${est.total_high:.2f}[/]\n"
+        "  (Mem0 + Zep cloud free tiers cover the smoke run. Statewave is\n"
+        "  self-hosted - no external cost.)"
+    )
 
 
 # ── `swb run` ──────────────────────────────────────────────────────────────

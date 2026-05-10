@@ -32,7 +32,7 @@ import time
 
 from ..dataset import LocomoConversation
 from ..llm import LlmClient, resolve_answer_model
-from .base import AnswerResult, MemorySystem
+from .base import AnswerResult, HealthResult, MemorySystem
 
 # Mem0 user_id charset is alphanumeric + dash. LoCoMo ids are
 # usually clean strings but some contain underscores / colons —
@@ -189,3 +189,21 @@ class Mem0System(MemorySystem):
         # Operators wanting a full purge across all bench user_ids
         # can iterate themselves.
         return None
+
+    def health_check(self) -> HealthResult:
+        # Cheap read on a guaranteed-empty user_id. Cloud + self-hosted
+        # both support this; a reachable Mem0 returns an empty result
+        # rather than 404, so the absence of an exception is the
+        # success signal. Auth failures (bad MEM0_API_KEY) raise here.
+        try:
+            self._client.get_all(user_id="bench-health-probe-nonexistent")
+            return HealthResult(ok=True, detail="ok")
+        except Exception as e:
+            return HealthResult(ok=False, detail=_short(e))
+
+
+def _short(err: object) -> str:
+    s = str(err)
+    if len(s) > 200:
+        s = s[:200] + "…"
+    return s.replace("\n", " ")

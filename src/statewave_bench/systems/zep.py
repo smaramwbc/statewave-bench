@@ -29,7 +29,7 @@ import time
 
 from ..dataset import LocomoConversation
 from ..llm import LlmClient, resolve_answer_model
-from .base import AnswerResult, MemorySystem
+from .base import AnswerResult, HealthResult, MemorySystem
 
 # Zep restricts user_id charset (alphanumeric + dash); LoCoMo ids are
 # usually clean but normalize to be safe.
@@ -160,3 +160,21 @@ class ZepSystem(MemorySystem):
         # user before re-creating). Full-bench teardown can iterate
         # users via client.user.list_ordered.
         return None
+
+    def health_check(self) -> HealthResult:
+        # Cheap read: list-ordered first page of users with page_size=1.
+        # Verifies the API key + project reachable without needing any
+        # specific user to exist. Returns either a tiny payload (success)
+        # or raises with auth / network / quota detail (failure).
+        try:
+            self._client.user.list_ordered(page_size=1)
+            return HealthResult(ok=True, detail="ok")
+        except Exception as e:
+            return HealthResult(ok=False, detail=_short(e))
+
+
+def _short(err: object) -> str:
+    s = str(err)
+    if len(s) > 200:
+        s = s[:200] + "…"
+    return s.replace("\n", " ")
