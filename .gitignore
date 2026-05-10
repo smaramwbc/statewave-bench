@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# uv
+.venv/
+.python-version
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Benchmark artifacts — large, machine-specific, never committed.
+# A sample run's results CAN be committed at release time by adding
+# `!results/published/` here (or whatever subdir you choose).
+data/locomo/
+results/*.json
+results/*.csv
+results/charts/
+!results/.gitkeep
+!data/.gitkeep
+
+# Secrets — operators export their own API keys per session; never check in.
+.env
+.env.*
+!.env.example

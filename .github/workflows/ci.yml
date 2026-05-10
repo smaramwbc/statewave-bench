@@ -1,0 +1,43 @@
+name: CI
+
+# Lint + format + type-check + unit tests on every PR. We deliberately
+# do NOT run the actual bench in CI — it makes billable LLM calls and
+# the published numbers are produced by the maintainers running on
+# their own keys + reviewing before publishing.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Lint (ruff)
+        run: uv run ruff check src tests
+
+      - name: Format check (ruff format)
+        run: uv run ruff format --check src tests
+
+      - name: Type-check (mypy)
+        run: uv run mypy src
+
+      - name: Run unit tests
+        run: uv run pytest -v
