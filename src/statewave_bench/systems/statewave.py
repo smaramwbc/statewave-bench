@@ -130,31 +130,30 @@ class StatewaveSystem(MemorySystem):
         #
         # `compile_memories_wait` returns a CompileJob with .status of
         # "completed" or "failed" (the SDK only raises on timeout).
-        # Surface both failure modes AND a zero-memories-on-completed
-        # result — the latter is what bit conv-26 silently: 19 episodes
-        # ingested, 0 memories produced, every answer call ran against
-        # an empty context, but the bench never said anything.
-        from ..runner import console
-
+        # We treat all three failure modes (timeout, status=failed,
+        # completed-but-zero-memories) as ingest failures and raise.
+        # The runner catches the exception and skips the question set
+        # for this (system, conversation) pair — better than silently
+        # scoring 199 questions against an empty bundle and burning
+        # ~$2 of answer-model spend per conversation.
         try:
             job = self._client.compile_memories_wait(subject_id, timeout=COMPILE_TIMEOUT_SEC)
-        except TimeoutError:
-            console.print(
-                f"[yellow]statewave compile timeout for {subject_id}[/] — "
-                f"falling through with whatever's compiled so far."
-            )
-            return
+        except TimeoutError as e:
+            raise RuntimeError(
+                f"compile timed out after {COMPILE_TIMEOUT_SEC}s for {subject_id} — "
+                f"memory not fully available, skipping conversation"
+            ) from e
         if job.status != "completed":
-            console.print(
-                f"[red]statewave compile failed for {subject_id}[/] "
+            raise RuntimeError(
+                f"compile failed for {subject_id} "
                 f"(job_id={job.job_id}, status={job.status}, error={job.error!r})"
             )
-        elif job.memories_created == 0:
-            console.print(
-                f"[yellow]statewave compile produced 0 memories for {subject_id}[/] "
-                f"(job_id={job.job_id}) — answers will run against an empty bundle. "
-                f"Check server-side compiler config (heuristic vs LLM, API keys, "
-                f"min-evidence thresholds)."
+        if job.memories_created == 0:
+            raise RuntimeError(
+                f"compile produced 0 memories for {subject_id} "
+                f"(job_id={job.job_id}) — server-side compiler may be misconfigured "
+                f"(heuristic vs LLM, LiteLLM API keys, min-evidence thresholds). "
+                f"Skipping rather than scoring against an empty bundle."
             )
 
     def answer(self, conversation_id: str, question: str) -> AnswerResult:
