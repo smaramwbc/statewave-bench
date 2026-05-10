@@ -47,9 +47,18 @@ DEFAULT_CONTEXT_MAX_TOKENS = 2048
 
 # Per-conversation compile uses the wait-for-completion path so the
 # bench's `answer` calls always run against fully-compiled memory.
-# 60s should be enough for any LoCoMo conversation; longer ones surface
-# in the logs as compile-timeout errors and the bench moves on.
-COMPILE_TIMEOUT_SEC = 60.0
+#
+# 180s timeout: the LLM compiler batches ~19 sessions through gpt-4o-mini
+# at concurrency 4 and typically finishes in 20-40s, but Anthropic /
+# OpenAI rate-limiting + retry can stretch a worst-case batch to 90s+.
+# Better to give the compile real headroom than to fail-and-retry a
+# whole conversation because of a transient slowdown.
+#
+# 2s poll: the SDK default is 500ms, which generates ~360 status GETs
+# over a 3-minute compile and floods the server logs. 2s drops that
+# by 4x with negligible impact on bench wall-time.
+COMPILE_TIMEOUT_SEC = 180.0
+COMPILE_POLL_INTERVAL_SEC = 2.0
 
 
 def _subject_for(conversation_id: str) -> str:
@@ -146,7 +155,11 @@ class StatewaveSystem(MemorySystem):
         # scoring 199 questions against an empty bundle and burning
         # ~$2 of answer-model spend per conversation.
         try:
-            job = self._client.compile_memories_wait(subject_id, timeout=COMPILE_TIMEOUT_SEC)
+            job = self._client.compile_memories_wait(
+                subject_id,
+                timeout=COMPILE_TIMEOUT_SEC,
+                poll_interval=COMPILE_POLL_INTERVAL_SEC,
+            )
         except TimeoutError as e:
             raise RuntimeError(
                 f"compile timed out after {COMPILE_TIMEOUT_SEC}s for {subject_id} — "
