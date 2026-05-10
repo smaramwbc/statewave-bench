@@ -96,6 +96,15 @@ class StatewaveSystem(MemorySystem):
         # Batch every session into one POST. Statewave's batch limit
         # is 100 episodes per request; LoCoMo conversations have ~5
         # sessions, so one batch is always enough.
+        #
+        # Per-message shape is `{role, content}` — Statewave's canonical
+        # shape, what `extract_payload_text` reads and what both the
+        # heuristic and LLM compilers feed into their extractors. Using
+        # `{speaker, text}` here would still pass schema validation but
+        # `extract_payload_text` would silently produce empty strings,
+        # so the compiler would persist zero memories with no error.
+        # We map LoCoMo's `speaker` (a name like "Caroline") to `role`
+        # so attribution survives into the compiled memory text.
         episodes_payload = [
             {
                 "subject_id": subject_id,
@@ -105,8 +114,8 @@ class StatewaveSystem(MemorySystem):
                     "session_id": session_idx,
                     "messages": [
                         {
-                            "speaker": turn.speaker,
-                            "text": turn.text,
+                            "role": turn.speaker,
+                            "content": turn.text,
                             "timestamp": turn.timestamp,
                         }
                         for turn in session
