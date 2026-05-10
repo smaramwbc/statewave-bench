@@ -39,7 +39,6 @@ from .llm import LlmClient, resolve_judge_model
 from .metrics import Score, score_answer
 from .systems.base import AnswerResult, MemorySystem
 
-
 console = Console()
 
 
@@ -91,9 +90,7 @@ def _load_completed_keys(path: Path) -> set[tuple[str, str, int]]:
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue  # skip malformed rows; partial-write tolerance
-            completed.add(
-                (row["system"], row["conversation_id"], row["question_idx"])
-            )
+            completed.add((row["system"], row["conversation_id"], row["question_idx"]))
     return completed
 
 
@@ -128,14 +125,17 @@ def run_bench(
     convs = list(conversations)
     total_questions = sum(len(c.qa) for c in convs) * len(systems)
 
-    with output_path.open("a", encoding="utf-8") as out_fh, Progress(
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TimeElapsedColumn(),
-        TextColumn("· {task.fields[stage]}"),
-        console=console,
-    ) as progress:
+    with (
+        output_path.open("a", encoding="utf-8") as out_fh,
+        Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            TextColumn("· {task.fields[stage]}"),
+            console=console,
+        ) as progress,
+    ):
         task = progress.add_task(
             "Running bench",
             total=total_questions,
@@ -150,20 +150,16 @@ def run_bench(
                 # has already been scored — avoids paying ingest cost
                 # twice on resume.
                 conv_questions_done = sum(
-                    1
-                    for i in range(len(conv.qa))
-                    if (system.name, conv.id, i) in already_done
+                    1 for i in range(len(conv.qa)) if (system.name, conv.id, i) in already_done
                 )
                 if conv_questions_done < len(conv.qa):
                     try:
                         system.ingest(conv)
                     except NotImplementedError as e:
-                        console.print(
-                            f"[red]System {system.name} ingest not implemented:[/] {e}"
-                        )
+                        console.print(f"[red]System {system.name} ingest not implemented:[/] {e}")
                         progress.update(task, advance=len(conv.qa))
                         continue
-                    except Exception as e:  # noqa: BLE001
+                    except Exception as e:
                         console.print(
                             f"[red]System {system.name} ingest failed for "
                             f"conversation {conv.id}:[/] {e}"
@@ -214,14 +210,11 @@ def _run_one_question(
         answer = system.answer(conv_id, qa.question)
         del start
     except NotImplementedError as e:
-        console.print(
-            f"[yellow]System {system.name} answer not implemented:[/] {e}"
-        )
+        console.print(f"[yellow]System {system.name} answer not implemented:[/] {e}")
         return None
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         console.print(
-            f"[red]System {system.name} answer failed[/] "
-            f"(conv={conv_id}, q={q_idx}): {e}"
+            f"[red]System {system.name} answer failed[/] (conv={conv_id}, q={q_idx}): {e}"
         )
         return None
 
@@ -234,7 +227,7 @@ def _run_one_question(
             llm=judge_llm,
             judge_model=judge_model,
         )
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         console.print(f"[red]Scoring failed[/] (conv={conv_id}, q={q_idx}): {e}")
         return None
 

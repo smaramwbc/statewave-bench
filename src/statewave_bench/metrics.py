@@ -32,7 +32,6 @@ from dataclasses import dataclass
 
 from .llm import LlmClient
 
-
 # LoCoMo categories that should be scored with LLM-as-judge rather
 # than F1. The category names match upstream's labels; categories not
 # listed default to F1.
@@ -106,11 +105,7 @@ _JUDGE_SYSTEM = (
 )
 
 _JUDGE_USER_TEMPLATE = (
-    "Question: {question}\n"
-    "Ground truth: {truth}\n"
-    "Prediction: {prediction}\n"
-    "\n"
-    "Verdict:"
+    "Question: {question}\nGround truth: {truth}\nPrediction: {prediction}\n\nVerdict:"
 )
 
 

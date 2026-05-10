@@ -6,36 +6,53 @@ when was it learned). Different shape from Mem0's flat fact store and
 Statewave's compiled-memories model — comparing all three on LoCoMo
 shows where each architecture's strengths actually land.
 
+Data model: each LoCoMo conversation maps to one Zep `user`, with
+one `thread` per conversation that holds every session's messages.
+Session boundaries are preserved via per-message metadata so Zep's
+graph extractor can use them as discontinuity hints.
+
 We use Zep Cloud (not the open-source Graphiti directly) because:
-  - It's the path Zep promotes for adoption (matches what users
-    actually try)
+  - It's the path Zep promotes for adoption (matches what users try)
   - Zero-setup for the bench operator (no Neo4j to provision)
   - Cloud has the latest server release; OSS lags
 
 Cost note: Zep's free tier covers our pilot run; the publishable full
 run may need a paid tier. Documented in the README's cost section.
-
-Implementation status: SCAFFOLDED. Wave A2 wires the real calls.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
+import re
 import time
 
 from ..dataset import LocomoConversation
 from ..llm import LlmClient, resolve_answer_model
 from .base import AnswerResult, MemorySystem
 
+# Zep restricts user_id charset (alphanumeric + dash); LoCoMo ids are
+# usually clean but normalize to be safe.
+_UNSAFE_USER_ID = re.compile(r"[^a-zA-Z0-9-]+")
 
-USER_ID_PREFIX = "bench-locomo-"  # Zep restricts user_id charset; no colons
+
+def _user_id_for(conversation_id: str) -> str:
+    safe = _UNSAFE_USER_ID.sub("-", conversation_id)
+    return f"bench-locomo-{safe}"
 
 
+def _thread_id_for(conversation_id: str) -> str:
+    return f"thread-{_user_id_for(conversation_id)}"
+
+
+# Zep's add_messages_batch is the fast path for bulk ingest — one
+# round-trip per session keeps the API budget bounded for ~600
+# conversations x ~5 sessions = ~3000 calls.
 class ZepSystem(MemorySystem):
     name = "zep"
 
     def __init__(self) -> None:
-        from zep_cloud.client import Zep  # type: ignore[import-not-found]
+        from zep_cloud.client import Zep
 
         api_key = os.environ.get("ZEP_API_KEY")
         if not api_key:
@@ -47,42 +64,99 @@ class ZepSystem(MemorySystem):
         self._llm = LlmClient()
 
     def ingest(self, conversation: LocomoConversation) -> None:
-        # Wave A2 will:
-        #   1. client.user.add(user_id=...) — create the per-conversation user
-        #   2. client.thread.create(...) — Zep's session/thread abstraction
-        #   3. For each LoCoMo session, post messages via
-        #      client.thread.add_messages(...). Zep extracts entities,
-        #      relationships, and temporal validity into the graph
-        #      automatically.
-        #
-        # Open question: do we use one Zep "thread" per LoCoMo session,
-        # or one thread per conversation? The conversation-as-thread
-        # model better matches "user has continuous memory across the
-        # whole multi-session interaction" — likely the right call but
-        # I want to validate against Zep's docs in Wave A2.
-        raise NotImplementedError(
-            "Zep ingest is scaffolded but not yet wired — Wave A2."
-        )
+        from zep_cloud.types.message import Message
+
+        user_id = _user_id_for(conversation.id)
+        thread_id = _thread_id_for(conversation.id)
+
+        # Idempotency: delete the user (cascade-deletes their threads
+        # and graph) before re-creating. 404 means no prior data — fine.
+        with contextlib.suppress(Exception):
+            self._client.user.delete(user_id=user_id)
+
+        # Create the user + the thread. Zep's user.add takes user_id
+        # by kw; thread.create needs both thread_id + user_id.
+        self._client.user.add(user_id=user_id, metadata={"bench": "locomo"})
+        self._client.thread.create(thread_id=thread_id, user_id=user_id)
+
+        # Add messages session-by-session. Zep extracts entities and
+        # relationships into the graph asynchronously after each call;
+        # the bench's per-conversation answer phase happens immediately
+        # after ingest, so questions effectively race the extraction —
+        # documented in the README so it's not a hidden variable.
+        for session_idx, session in enumerate(conversation.sessions):
+            if not session:
+                continue
+            messages = [
+                Message(
+                    content=turn.text,
+                    role=("assistant" if turn.speaker.lower() == "assistant" else "user"),
+                    name=turn.speaker,
+                    metadata={"session_id": session_idx, "bench": "locomo"},
+                )
+                for turn in session
+            ]
+            try:
+                self._client.thread.add_messages(
+                    thread_id,
+                    messages=messages,
+                )
+            except Exception as e:
+                from ..runner import console
+
+                console.print(
+                    f"[yellow]zep ingest failed for session {session_idx} "
+                    f"of {conversation.id}:[/] {e}"
+                )
 
     def answer(self, conversation_id: str, question: str) -> AnswerResult:
-        # Wave A2 will:
-        #   1. client.memory.get(user_id=..., last_n=N) — retrieves
-        #      Zep's structured memory bundle (facts + summary +
-        #      relevant_facts). The bundle is already ranked by Zep's
-        #      retrieval logic; we just pass it through.
-        #   2. Format the bundle into a prompt (Zep ships a recommended
-        #      prompt template — we'll use it verbatim so we're
-        #      benchmarking Zep-as-deployed, not our prompt-engineering)
-        #   3. Call the shared answer model
-        del conversation_id, question
+        thread_id = _thread_id_for(conversation_id)
+        start = time.perf_counter()
+
+        # Step 1: retrieve Zep's structured memory bundle. This is
+        # Zep's recommended retrieval entry point — it returns a
+        # ready-to-paste-into-prompt context string built from the
+        # graph's relevant facts + thread summary. We use it as-is so
+        # we're benchmarking Zep-as-deployed, not our prompt-engineering.
+        try:
+            memory = self._client.thread.get_user_context(thread_id)
+            context = memory.context or "(no relevant memories found)"
+        except Exception as e:
+            from ..runner import console
+
+            console.print(f"[yellow]zep get_user_context failed:[/] {e}")
+            context = "(retrieval failed)"
+
+        # Step 2: prompt the shared answer model with the bundle.
         model = resolve_answer_model()
-        elapsed_ms = (time.perf_counter() - time.perf_counter()) * 1000
-        del model, elapsed_ms
-        raise NotImplementedError(
-            "Zep answer is scaffolded but not yet wired — Wave A2."
+        prompt = (
+            "Answer the question using the context below. If the answer "
+            "isn't in the context, say so honestly — do not fabricate.\n\n"
+            f"--- Context ---\n{context}\n\n"
+            f"--- Question ---\n{question}"
+        )
+        result = self._llm.complete(
+            model=model,
+            system=None,
+            user=prompt,
+            max_tokens=512,
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+        return AnswerResult(
+            answer=result.answer,
+            answer_model=model,
+            answer_input_tokens=result.input_tokens,
+            answer_output_tokens=result.output_tokens,
+            elapsed_ms=elapsed_ms,
+            retrieved_context=context,
+            # Zep's graph build runs LLM calls server-side that bill
+            # against the operator's Zep plan, not against an external
+            # provider key. Documented in README cost section.
         )
 
     def reset(self) -> None:
-        # Wave A2 — Zep's API has user.delete which cascades to threads
-        # and graph nodes. Nice fit for bench teardown.
+        # Per-conversation cleanup is handled in `ingest` (deletes the
+        # user before re-creating). Full-bench teardown can iterate
+        # users via client.user.list_ordered.
         return None

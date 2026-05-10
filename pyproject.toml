@@ -102,6 +102,14 @@ python_version = "3.11"
 strict = true
 warn_unused_ignores = true
 
+# Third-party SDKs we adapter-wrap don't ship type stubs (or ship
+# incomplete ones). We don't gain much from mypy on the adapter-
+# boundary, and losing strict checks across the whole adapter file
+# would mask real issues — the per-module ignore is the surgical fix.
+[[tool.mypy.overrides]]
+module = ["mem0", "mem0.*", "zep_cloud", "zep_cloud.*", "statewave", "statewave.*", "datasets"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
