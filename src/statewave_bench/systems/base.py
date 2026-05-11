@@ -99,3 +99,23 @@ class MemorySystem(ABC):
         usually skip resetting (the bench scopes by conversation_id)
         but can offer a `--reset-cloud` opt-in flag for full purges."""
         return None
+
+    def health_check(self) -> HealthResult:
+        """Optional — verify the system is reachable BEFORE the bench
+        burns money on a doomed run.
+
+        Default: assume ok (operators who care about pre-flight
+        validation override per-system with a cheap read call —
+        Mem0 + Zep list users, Statewave probes a known-nonexistent
+        subject for connectivity, baselines no-op). Feeds
+        `swb config-check`'s output table."""
+        return HealthResult(ok=True, detail="(no live health check implemented)")
+
+
+@dataclass(frozen=True)
+class HealthResult:
+    """Outcome of a per-system health probe. The detail string is
+    operator-facing — keep it one-line, no stack traces."""
+
+    ok: bool
+    detail: str

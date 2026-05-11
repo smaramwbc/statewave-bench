@@ -65,21 +65,21 @@ uv run swb report
 
 - Every system's `ingest` calls (Mem0's fact extraction, Statewave's optional LLM compile, Zep's graph build)
 - Every question's `answer` call (the shared LLM the bench fixes for fair comparison)
-- Every LLM-as-judge call on open-ended questions (a separate model scores answers)
+- One judge call per non-`single_hop` question (a separate model scores reasoning answers as CORRECT/INCORRECT; an adversarial-specific judge marks refusals as REFUSAL/FABRICATION)
 
 LoCoMo's full dataset is **10 conversations × ~199 questions = ~1,986 questions per system**. The bench runs every question through every system, so 5 systems × 1,986 questions = ~9,930 question-runs total. Per question we make:
 
 - 1 retrieval call (free for the bench's accounting — Mem0 / Zep handle internally; Statewave runs locally)
 - 1 answer call (~3K input + ~256 output tokens on Sonnet ≈ $0.013)
-- 1 judge call only for `open_domain` questions (~500 input + 8 output on GPT-4o ≈ $0.001)
+- 1 judge call for every question except `single_hop` (~83% of LoCoMo: `multi_hop`, `temporal`, `open_domain`, `adversarial` are all LLM-scored; ~500 input + 8 output on GPT-4o ≈ $0.001)
 
-Approximate costs on Claude 3.5 Sonnet + GPT-4o judge, January 2026 prices:
+Approximate costs on Claude Sonnet 4.6 + GPT-4o judge, January 2026 prices:
 
-| Run scope | Question-runs | Estimated cost |
-|---|---:|---:|
-| Smoke (1 conversation, all 5 systems) | ~995 | $10–$15 |
-| Pilot (3 conversations) | ~2,985 | $30–$45 |
-| Full set (10 conversations) | ~9,930 | $100–$150 |
+| Run scope | Question-runs | Judge calls | Estimated cost |
+|---|---:|---:|---:|
+| Smoke (1 conversation, all 5 systems) | ~995 | ~825 | $13–$18 |
+| Pilot (3 conversations) | ~2,985 | ~2,475 | $40–$55 |
+| Full set (10 conversations) | ~9,930 | ~8,240 | $130–$180 |
 
 Plus internal LLM costs the bench doesn't directly observe:
 
@@ -99,22 +99,25 @@ Mem0 cloud + Zep cloud free tiers cover the smoke + pilot runs. Statewave's cost
 
 Categories per the paper's Table 1:
 
-- `single_hop` (code 1) — answer lives in one utterance
+- `single_hop` (code 1) — answer lives in one utterance; short factoid
 - `multi_hop` (code 2) — answer requires combining facts from multiple utterances or sessions
 - `temporal` (code 3) — answer requires reasoning about *when* things happened
-- `open_domain` (code 4) — answer is open-ended; scored via LLM-as-judge instead of F1
+- `open_domain` (code 4) — answer is open-ended
 - `adversarial` (code 5) — answer isn't in the conversation at all; the model should refuse
 
 We report scores per-category alongside the overall mean — a system that crushes single-session questions but bombs multi-session ones shouldn't get to hide that under one global number.
 
 ### Scoring
 
-- **Exact-answer questions** — token-level F1 (SQuAD-style normalization: lowercase, drop punctuation, drop articles, collapse whitespace). Identical to LoCoMo's reference evaluator.
-- **Open-ended questions** — LLM-as-judge. The judge model is deliberately *different* from the answer model (default: GPT-4o judge for Sonnet answers) to reduce same-model-bias. The judge returns CORRECT (1.0) or INCORRECT (0.0) per question.
+LoCoMo questions split into three scoring regimes (aligned with the paper's reference evaluator):
+
+- **`single_hop` — token-level F1.** SQuAD-style normalization (lowercase, drop punctuation, drop articles, collapse whitespace). The ground truth is unambiguous and any correct answer overlaps the truth tokens, so token overlap is the right metric.
+- **`multi_hop` / `temporal` / `open_domain` — LLM-as-judge.** The ground truth is a natural-language explanation; token-level F1 systematically penalizes verbose-but-correct paraphrases. A separate judge model (default: GPT-4o, deliberately different from the answer model to reduce same-model-bias) decides whether the prediction is semantically equivalent to the ground truth and returns CORRECT (1.0) or INCORRECT (0.0).
+- **`adversarial` — refusal judge.** The correct behavior is refusal; the ground truth is an empty string, and F1 against empty truth always returns 0 for any non-empty refusal text. A dedicated judge prompt returns REFUSAL (1.0) when the model declines to commit to a factual answer, or FABRICATION (0.0) when it answers a question that has no answer in the conversation.
 
 ### Fairness controls
 
-- **Same answer model across systems.** Whichever model the operator chooses (default: Claude 3.5 Sonnet at temp=0), every system uses it for the final answer. A system can't win because it picked a stronger model.
+- **Same answer model across systems.** Whichever model the operator chooses (default: Claude Sonnet 4.6 at temp=0), every system uses it for the final answer. A system can't win because it picked a stronger model.
 - **Same judge model across systems.** Same logic.
 - **Internal LLM costs reported separately.** Systems that issue their own LLM calls during ingest (Mem0's fact extractor, Statewave's optional LLM compiler) report those tokens under `internal_input_tokens` / `internal_output_tokens` so the operator sees the full bill, not just the answer-model cost.
 - **Per-conversation isolation.** Every system scopes its memory by conversation id (`bench:locomo:<id>` for Statewave/Mem0, `bench-locomo-<id>` for Zep). No cross-conversation leakage.
@@ -122,14 +125,16 @@ We report scores per-category alongside the overall mean — a system that crush
 
 ### Resumability
 
-Results stream to `results/run.jsonl` as the bench progresses. If a run dies halfway through (Anthropic 529, Mem0 rate-limit, kernel panic), re-running `swb run` picks up from the last completed `(system, conversation, question)` tuple. No re-doing work.
+Results stream to `results/run.jsonl` as the bench progresses. `swb run` is **fresh-by-default**: an existing file at the output path is deleted at startup so every run exercises the full `delete → ingest → compile → retrieve → answer` chain (otherwise the resume optimization would skip ingest for already-scored conversations, and you'd never test fixes to those layers).
+
+Pass `--resume` to opt back in to the legacy behavior: keep the existing file and skip already-completed `(system, conversation, question)` tuples. Useful for the multi-hour full-set run that might hit a transient error (Anthropic 529, Mem0 rate-limit, kernel panic) — re-run with `--resume` to pick up from the last gap.
 
 ## Layout
 
 ```
 statewave-bench/
 ├── src/statewave_bench/
-│   ├── cli.py              # `swb` entry point: config-check / run / report
+│   ├── cli.py              # `swb` entry point: config-check / run / rescore / report
 │   ├── dataset.py          # LoCoMo loader (HuggingFace cache)
 │   ├── llm.py              # unified Anthropic + OpenAI client
 │   ├── metrics.py          # F1 + LLM-as-judge
