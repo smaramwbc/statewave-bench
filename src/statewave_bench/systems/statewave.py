@@ -124,7 +124,19 @@ class StatewaveSystem(MemorySystem):
                     "messages": [
                         {
                             "role": turn.speaker,
-                            "content": turn.text,
+                            # Prepend the LoCoMo timestamp to the message
+                            # text so the LLM compiler sees absolute dates
+                            # (the server's `extract_payload_text` joins
+                            # `{role}: {content}` and drops every other
+                            # payload field — including `timestamp`). The
+                            # bench's temporal + multi-hop "When did X?"
+                            # questions are unanswerable otherwise: the
+                            # conversation uses relative phrases like
+                            # "last Saturday" that only resolve against an
+                            # absolute date stamp.
+                            "content": (
+                                f"[{turn.timestamp}] {turn.text}" if turn.timestamp else turn.text
+                            ),
                             "timestamp": turn.timestamp,
                         }
                         for turn in session

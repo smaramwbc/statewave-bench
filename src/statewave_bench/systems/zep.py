@@ -45,6 +45,12 @@ def _thread_id_for(conversation_id: str) -> str:
     return f"thread-{_user_id_for(conversation_id)}"
 
 
+# Zep cloud's add_messages endpoint enforces a 30-message-per-request
+# cap (400: "messages cannot contain more than 30 items"). LoCoMo
+# sessions can hit 40-60 turns, so we chunk per session.
+ZEP_MAX_MESSAGES_PER_REQUEST = 30
+
+
 # Zep's add_messages_batch is the fast path for bulk ingest — one
 # round-trip per session keeps the API budget bounded for ~600
 # conversations x ~5 sessions = ~3000 calls.
@@ -87,27 +93,41 @@ class ZepSystem(MemorySystem):
         for session_idx, session in enumerate(conversation.sessions):
             if not session:
                 continue
+            # Zep's `name` field preserves the speaker, but graph
+            # extraction operates on `content`. Without the LoCoMo
+            # timestamp in content, the graph never gets the absolute
+            # date for relative phrases ("last Saturday", "two days
+            # ago") and the bench's temporal questions are unanswerable.
             messages = [
                 Message(
-                    content=turn.text,
+                    content=(f"[{turn.timestamp}] {turn.text}" if turn.timestamp else turn.text),
                     role=("assistant" if turn.speaker.lower() == "assistant" else "user"),
                     name=turn.speaker,
                     metadata={"session_id": session_idx, "bench": "locomo"},
                 )
                 for turn in session
             ]
-            try:
-                self._client.thread.add_messages(
-                    thread_id,
-                    messages=messages,
-                )
-            except Exception as e:
-                from ..runner import console
+            # Chunk to stay under Zep's 30-message cap. We preserve
+            # in-session order across chunks so the graph extractor
+            # sees the conversation flow intact — submitting chunks
+            # serially is fine because add_messages is synchronous
+            # (extraction is async on Zep's side, but the API call
+            # itself returns when the messages are accepted).
+            for chunk_start in range(0, len(messages), ZEP_MAX_MESSAGES_PER_REQUEST):
+                chunk = messages[chunk_start : chunk_start + ZEP_MAX_MESSAGES_PER_REQUEST]
+                try:
+                    self._client.thread.add_messages(
+                        thread_id,
+                        messages=chunk,
+                    )
+                except Exception as e:
+                    from ..runner import console
 
-                console.print(
-                    f"[yellow]zep ingest failed for session {session_idx} "
-                    f"of {conversation.id}:[/] {e}"
-                )
+                    console.print(
+                        f"[yellow]zep ingest failed for session {session_idx} "
+                        f"(chunk {chunk_start // ZEP_MAX_MESSAGES_PER_REQUEST}) "
+                        f"of {conversation.id}:[/] {e}"
+                    )
 
     def answer(self, conversation_id: str, question: str) -> AnswerResult:
         thread_id = _thread_id_for(conversation_id)

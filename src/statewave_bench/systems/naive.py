@@ -51,7 +51,15 @@ class NaiveSystem(MemorySystem):
 
     def answer(self, conversation_id: str, question: str) -> AnswerResult:
         window = self._windows.get(conversation_id) or deque()
-        context = "\n".join(f"{t.speaker}: {t.text}" for t in window)
+        # Include LoCoMo timestamps in the dumped context so the naive
+        # baseline isn't artificially handicapped on temporal questions
+        # (the conversation uses relative phrases — "last Saturday",
+        # "two days ago" — that only resolve against an absolute date).
+        # Same shape every vendor adapter sees, for cross-system fairness.
+        context = "\n".join(
+            f"[{t.timestamp}] {t.speaker}: {t.text}" if t.timestamp else f"{t.speaker}: {t.text}"
+            for t in window
+        )
         model = resolve_answer_model()
         prompt = (
             "Use the conversation history below to answer the question. "
