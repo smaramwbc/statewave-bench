@@ -12,7 +12,7 @@ import time
 
 from ..dataset import LocomoConversation
 from ..llm import LlmClient, resolve_answer_model
-from .base import AnswerResult, MemorySystem
+from .base import AnswerResult, HealthResult, MemorySystem
 
 
 class NoMemorySystem(MemorySystem):
@@ -46,3 +46,8 @@ class NoMemorySystem(MemorySystem):
             elapsed_ms=elapsed_ms,
             retrieved_context=None,
         )
+
+    def health_check(self) -> HealthResult:
+        # Same story as naive: no remote state; the LLM provider check
+        # covers the only failure mode.
+        return HealthResult(ok=True, detail="(baseline — no remote state)")

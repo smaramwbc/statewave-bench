@@ -32,7 +32,7 @@ import time
 
 from ..dataset import LocomoConversation
 from ..llm import LlmClient, resolve_answer_model
-from .base import AnswerResult, MemorySystem
+from .base import AnswerResult, HealthResult, MemorySystem
 
 # Mem0 user_id charset is alphanumeric + dash. LoCoMo ids are
 # usually clean strings but some contain underscores / colons —
@@ -77,11 +77,10 @@ class Mem0System(MemorySystem):
         user_id = _user_id_for(conversation.id)
 
         # Idempotency: clear prior memories for this user_id before
-        # ingesting. The cloud SDK's delete_all(user_id=...) does this
-        # in one call; the self-hosted SDK has the same shape. Empty
-        # subject (404) is fine; other errors surface on the next call.
+        # ingesting. 404 / empty-subject is fine; other errors surface
+        # on the next call.
         with contextlib.suppress(Exception):
-            self._client.delete_all(user_id=user_id)
+            self._delete_all(user_id)
 
         # Mem0 takes message lists in OpenAI-style {role, content}
         # shape. We feed every session as one batch so Mem0's fact
@@ -92,16 +91,31 @@ class Mem0System(MemorySystem):
         for session_idx, session in enumerate(conversation.sessions):
             if not session:
                 continue
+
+            # Mem0's message shape uses generic user/assistant roles
+            # (the SDK's fact extractor expects OpenAI-style chat
+            # messages), so the speaker name has to live in `content`.
+            # Same applies for the LoCoMo timestamp — without it the
+            # fact extractor can't answer "When did X happen?" because
+            # the conversation only uses relative phrases like
+            # "last Saturday".
+            def _content_for(turn: object) -> str:
+                ts = getattr(turn, "timestamp", "") or ""
+                speaker = getattr(turn, "speaker", "") or ""
+                text = getattr(turn, "text", "")
+                prefix = f"[{ts}] " if ts else ""
+                return f"{prefix}{speaker}: {text}" if speaker else f"{prefix}{text}"
+
             messages = [
                 {
                     "role": "user" if turn.speaker.lower() != "assistant" else "assistant",
-                    "content": turn.text,
+                    "content": _content_for(turn),
                 }
                 for turn in session
             ]
             try:
-                self._client.add(
-                    messages,
+                self._add(
+                    messages=messages,
                     user_id=user_id,
                     metadata={
                         "session_id": session_idx,
@@ -125,11 +139,7 @@ class Mem0System(MemorySystem):
         start = time.perf_counter()
 
         # Step 1: retrieve memories.
-        search_result = self._client.search(
-            question,
-            user_id=user_id,
-            top_k=DEFAULT_TOP_K,
-        )
+        search_result = self._search(query=question, user_id=user_id, top_k=DEFAULT_TOP_K)
 
         # The SDK returns either {"results": [...]} (cloud v2 shape)
         # or just [...] (older / self-hosted). Handle both.
@@ -189,3 +199,63 @@ class Mem0System(MemorySystem):
         # Operators wanting a full purge across all bench user_ids
         # can iterate themselves.
         return None
+
+    def health_check(self) -> HealthResult:
+        # Cheap read on a guaranteed-empty user_id. Routes through the
+        # same v2-aware helper as the real ingest/answer paths so the
+        # probe fails the same way the runner would.
+        try:
+            self._get_all(user_id="bench-health-probe-nonexistent")
+            return HealthResult(ok=True, detail="ok")
+        except Exception as e:
+            return HealthResult(ok=False, detail=_short(e))
+
+    # ── Cloud-vs-self-hosted shims ────────────────────────────────────────
+    # Mem0's cloud API splits the contract by read vs write:
+    #
+    #   Writes (add, delete_all):
+    #     REQUIRE top-level `user_id=`. Identity in `filters=` returns
+    #     400 "At least one entity ID is required".
+    #
+    #   Reads (search, get_all):
+    #     REJECT top-level `user_id=` with "Top-level entity parameters
+    #     not supported in <method>(). Use filters={'user_id': ...}".
+    #     Also require `version="v2"` — without it, search hits the v1
+    #     endpoint which silently returns `{'results': []}` regardless
+    #     of stored memories. That silent-empty behavior is the worst
+    #     possible failure mode for the bench (zero retrieval but no
+    #     error), so version="v2" is non-negotiable here.
+    #
+    # Self-hosted `Memory` accepts top-level `user_id=` for writes and
+    # `filters=` for reads; the `version` kwarg is ignored on self-
+    # hosted, so the same call works in both modes.
+
+    def _add(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        user_id: str,
+        metadata: dict[str, object],
+    ) -> object:
+        return self._client.add(messages, user_id=user_id, metadata=metadata)
+
+    def _search(self, *, query: str, user_id: str, top_k: int) -> object:
+        return self._client.search(
+            query,
+            filters={"user_id": user_id},
+            top_k=top_k,
+            version="v2",
+        )
+
+    def _get_all(self, *, user_id: str) -> object:
+        return self._client.get_all(filters={"user_id": user_id}, version="v2")
+
+    def _delete_all(self, user_id: str) -> object:
+        return self._client.delete_all(user_id=user_id)
+
+
+def _short(err: object) -> str:
+    s = str(err)
+    if len(s) > 200:
+        s = s[:200] + "…"
+    return s.replace("\n", " ")

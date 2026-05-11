@@ -41,6 +41,16 @@ from .systems.base import AnswerResult, MemorySystem
 
 console = Console()
 
+# Fast-fail circuit-breaker: if N consecutive `answer` calls fail for
+# the same (system, conversation), skip the rest of that conversation
+# for that system. Saves the operator from burning the whole question
+# set when a provider's API is down / out-of-balance / mis-keyed.
+#
+# 3 is conservative — one transient blip won't trip it; three in a
+# row almost always means systemic. The runner logs the abort so it's
+# visible in the JSONL trailer.
+FAILURE_STREAK_THRESHOLD = 3
+
 
 # ── Result records ────────────────────────────────────────────────────────
 
@@ -110,11 +120,6 @@ def run_bench(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     already_done = _load_completed_keys(output_path)
-    if already_done:
-        console.print(
-            f"[yellow]Resume mode:[/] {len(already_done)} result rows already in "
-            f"{output_path} — skipping those."
-        )
 
     judge_llm = llm or LlmClient()
     judge_model = resolve_judge_model()
@@ -124,6 +129,35 @@ def run_bench(
     # cost is fine.
     convs = list(conversations)
     total_questions = sum(len(c.qa) for c in convs) * len(systems)
+
+    # Per-system resume breakdown: thin "23 rows already" messages
+    # let stale-state bugs (IDE buffer overwriting the JSONL, an old
+    # archive being read, schema drift) hide for minutes before the
+    # operator notices the bench is redoing finished work. The
+    # per-system breakdown surfaces the plan up front so a mismatch
+    # against expectations is visible in the first second of output.
+    if already_done or total_questions:
+        planned_per_system = {s.name: sum(len(c.qa) for c in convs) for s in systems}
+        done_per_system: dict[str, int] = {s.name: 0 for s in systems}
+        for sys_name, _conv_id, _q_idx in already_done:
+            if sys_name in done_per_system:
+                done_per_system[sys_name] += 1
+        planned_remaining = total_questions - sum(done_per_system.values())
+        console.print(
+            f"[bold]Plan:[/] {planned_remaining} of {total_questions} question-runs "
+            f"remaining across {len(systems)} system(s)"
+            + (f"; {sum(done_per_system.values())} already done." if already_done else ".")
+        )
+        for s in systems:
+            planned = planned_per_system[s.name]
+            done = done_per_system[s.name]
+            remaining = planned - done
+            status = (
+                "[green]done[/]"
+                if remaining == 0
+                else f"{remaining} remaining" + (f" ([yellow]{done} done[/])" if done else "")
+            )
+            console.print(f"  - {s.name}: {status}")
 
     with (
         output_path.open("a", encoding="utf-8") as out_fh,
@@ -167,9 +201,32 @@ def run_bench(
                         progress.update(task, advance=len(conv.qa))
                         continue
 
-                # Per-question loop.
+                # Per-question loop. The failure streak counter resets
+                # at the start of every (system, conversation) pair —
+                # one system's dead API shouldn't kill the next system,
+                # and a conversation that's been completed for one
+                # system shouldn't poison the next conversation.
+                failure_streak = 0
+                aborted_for_streak = False
                 for q_idx, qa in enumerate(conv.qa):
                     if (system.name, conv.id, q_idx) in already_done:
+                        progress.update(task, advance=1)
+                        continue
+                    if failure_streak >= FAILURE_STREAK_THRESHOLD:
+                        # Skip the rest of this conversation for this
+                        # system. The runner already logged the
+                        # individual failures via _run_one_question;
+                        # surface the abort once here so the operator
+                        # sees the circuit-breaker fired without
+                        # scrolling through 200 identical errors.
+                        if not aborted_for_streak:
+                            console.print(
+                                f"[red]Aborting {system.name} / {conv.id}[/] "
+                                f"after {FAILURE_STREAK_THRESHOLD} consecutive "
+                                f"answer failures — skipping remaining "
+                                f"{len(conv.qa) - q_idx} questions for this pair."
+                            )
+                            aborted_for_streak = True
                         progress.update(task, advance=1)
                         continue
                     progress.update(
@@ -184,7 +241,10 @@ def run_bench(
                         judge_llm=judge_llm,
                         judge_model=judge_model,
                     )
-                    if record is not None:
+                    if record is None:
+                        failure_streak += 1
+                    else:
+                        failure_streak = 0  # one success resets the breaker
                         out_fh.write(json.dumps(record) + "\n")
                         out_fh.flush()
                     progress.update(task, advance=1)

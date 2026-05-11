@@ -24,7 +24,7 @@ from collections import defaultdict, deque
 
 from ..dataset import LocomoConversation, LocomoTurn
 from ..llm import LlmClient, resolve_answer_model
-from .base import AnswerResult, MemorySystem
+from .base import AnswerResult, HealthResult, MemorySystem
 
 # Tunable: how many turns to keep. 100 is a deliberately permissive
 # floor — it gives the naive baseline a fair shot at single-session
@@ -51,7 +51,15 @@ class NaiveSystem(MemorySystem):
 
     def answer(self, conversation_id: str, question: str) -> AnswerResult:
         window = self._windows.get(conversation_id) or deque()
-        context = "\n".join(f"{t.speaker}: {t.text}" for t in window)
+        # Include LoCoMo timestamps in the dumped context so the naive
+        # baseline isn't artificially handicapped on temporal questions
+        # (the conversation uses relative phrases — "last Saturday",
+        # "two days ago" — that only resolve against an absolute date).
+        # Same shape every vendor adapter sees, for cross-system fairness.
+        context = "\n".join(
+            f"[{t.timestamp}] {t.speaker}: {t.text}" if t.timestamp else f"{t.speaker}: {t.text}"
+            for t in window
+        )
         model = resolve_answer_model()
         prompt = (
             "Use the conversation history below to answer the question. "
@@ -78,3 +86,10 @@ class NaiveSystem(MemorySystem):
 
     def reset(self) -> None:
         self._windows.clear()
+
+    def health_check(self) -> HealthResult:
+        # The naive baseline has no remote state — it just keeps a
+        # rolling deque in memory. The only thing that can fail at
+        # health-probe time is the LLM client itself, which the
+        # provider-level Anthropic/OpenAI checks already cover.
+        return HealthResult(ok=True, detail="(baseline — no remote state)")
