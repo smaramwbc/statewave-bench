@@ -50,6 +50,34 @@ def _thread_id_for(conversation_id: str) -> str:
 # sessions can hit 40-60 turns, so we chunk per session.
 ZEP_MAX_MESSAGES_PER_REQUEST = 30
 
+# Zep's graph build is async with TWO async phases:
+#   1. Message ingestion — completes in ~5-10s; `task.get(task_id).status`
+#      flips to "completed" once messages are persisted.
+#   2. Graph extraction — runs BEHIND the task's "completed" flag and
+#      keeps populating entities + facts for ~30-60s afterwards.
+#
+# Waiting only on the task status lands us in the gap between phases:
+# we resume answering questions against a half-built graph (this is
+# what tanked Zep to 0.000 on multi_hop in the first run; tasks
+# reported done at t+7s while the graph kept growing through t+60s).
+# So we wait on task completion AND then poll `get_user_context`
+# until the context length stops growing for several consecutive polls.
+ZEP_TASK_TIMEOUT_SEC = 180.0
+ZEP_TASK_POLL_INTERVAL_SEC = 2.0
+ZEP_TERMINAL_STATUSES = frozenset({"completed", "success", "succeeded", "failed", "error"})
+
+# Graph-extraction settle: poll get_user_context until its body length
+# doesn't change for N consecutive polls. 3 polls x 5s = 15s of
+# stability is empirically enough to declare the graph "stable enough"
+# on a 19-session LoCoMo conversation.
+ZEP_GRAPH_SETTLE_POLL_SEC = 5.0
+ZEP_GRAPH_SETTLE_STABLE_COUNT = 3
+# 240s empirically — a 19-session LoCoMo conversation was still growing
+# at 120s in the first verification probe. Doubling the budget so the
+# bench measures Zep's actual graph (not a half-built one) without
+# making per-conversation wall time unreasonable.
+ZEP_GRAPH_SETTLE_TIMEOUT_SEC = 240.0
+
 
 # Zep's add_messages_batch is the fast path for bulk ingest — one
 # round-trip per session keeps the API budget bounded for ~600
@@ -85,11 +113,13 @@ class ZepSystem(MemorySystem):
         self._client.user.add(user_id=user_id, metadata={"bench": "locomo"})
         self._client.thread.create(thread_id=thread_id, user_id=user_id)
 
-        # Add messages session-by-session. Zep extracts entities and
-        # relationships into the graph asynchronously after each call;
-        # the bench's per-conversation answer phase happens immediately
-        # after ingest, so questions effectively race the extraction —
-        # documented in the README so it's not a hidden variable.
+        # Add messages session-by-session. Zep's graph extraction is
+        # async — every add_messages returns a task_id, and we have to
+        # wait for those tasks to complete before issuing `answer`
+        # calls, otherwise retrieval hits a half-built graph (this is
+        # what tanked Zep to 0.000 on multi_hop and 0.029 on
+        # open_domain in the first cross-system run).
+        task_ids: list[str] = []
         for session_idx, session in enumerate(conversation.sessions):
             if not session:
                 continue
@@ -116,10 +146,13 @@ class ZepSystem(MemorySystem):
             for chunk_start in range(0, len(messages), ZEP_MAX_MESSAGES_PER_REQUEST):
                 chunk = messages[chunk_start : chunk_start + ZEP_MAX_MESSAGES_PER_REQUEST]
                 try:
-                    self._client.thread.add_messages(
+                    response = self._client.thread.add_messages(
                         thread_id,
                         messages=chunk,
                     )
+                    task_id = getattr(response, "task_id", None)
+                    if task_id:
+                        task_ids.append(task_id)
                 except Exception as e:
                     from ..runner import console
 
@@ -128,6 +161,85 @@ class ZepSystem(MemorySystem):
                         f"(chunk {chunk_start // ZEP_MAX_MESSAGES_PER_REQUEST}) "
                         f"of {conversation.id}:[/] {e}"
                     )
+
+        # Block until all graph-build tasks are terminal (completed or
+        # failed). Mirrors the Statewave compile-wait contract: ingest
+        # only returns once memory is queryable. Without this the bench
+        # would race the async build and score against an empty graph.
+        self._wait_for_tasks(task_ids, conversation_id=conversation.id)
+
+        # Tasks completing only means messages were ingested. The graph
+        # extractor keeps populating facts for another ~30-60s. Poll
+        # the assembled context until it stops growing for a few
+        # consecutive samples before declaring the graph "settled".
+        self._wait_for_graph_settle(thread_id=thread_id, conversation_id=conversation.id)
+
+    def _wait_for_tasks(self, task_ids: list[str], *, conversation_id: str) -> None:
+        if not task_ids:
+            return
+        from ..runner import console
+
+        pending = list(task_ids)
+        elapsed = 0.0
+        while pending and elapsed < ZEP_TASK_TIMEOUT_SEC:
+            still_pending: list[str] = []
+            for tid in pending:
+                try:
+                    task = self._client.task.get(tid)
+                except Exception as e:
+                    # Polling failure is non-fatal — we treat it as
+                    # "still pending" and try again next tick. If the
+                    # whole API is down, the timeout below catches it.
+                    console.print(f"[yellow]zep task poll failed for {tid}:[/] {e}")
+                    still_pending.append(tid)
+                    continue
+                status = (task.status or "").lower()
+                if status in ZEP_TERMINAL_STATUSES:
+                    if status not in ("completed", "success", "succeeded"):
+                        console.print(
+                            f"[yellow]zep task {tid} ended {status!r} "
+                            f"(conv={conversation_id}); proceeding with partial graph."
+                        )
+                    continue
+                still_pending.append(tid)
+            pending = still_pending
+            if pending:
+                time.sleep(ZEP_TASK_POLL_INTERVAL_SEC)
+                elapsed += ZEP_TASK_POLL_INTERVAL_SEC
+        if pending:
+            console.print(
+                f"[yellow]zep ingest: {len(pending)} task(s) still pending after "
+                f"{ZEP_TASK_TIMEOUT_SEC:.0f}s for {conversation_id}; "
+                f"proceeding with whatever's been built."
+            )
+
+    def _wait_for_graph_settle(self, *, thread_id: str, conversation_id: str) -> None:
+        from ..runner import console
+
+        last_length: int | None = None
+        stable_count = 0
+        elapsed = 0.0
+        while elapsed < ZEP_GRAPH_SETTLE_TIMEOUT_SEC:
+            try:
+                ctx = self._client.thread.get_user_context(thread_id)
+                body = ctx.context or ""
+            except Exception as e:
+                console.print(f"[yellow]zep settle-poll failed for {thread_id}:[/] {e}")
+                return
+            length = len(body)
+            if last_length is not None and length == last_length:
+                stable_count += 1
+                if stable_count >= ZEP_GRAPH_SETTLE_STABLE_COUNT:
+                    return
+            else:
+                stable_count = 0
+            last_length = length
+            time.sleep(ZEP_GRAPH_SETTLE_POLL_SEC)
+            elapsed += ZEP_GRAPH_SETTLE_POLL_SEC
+        console.print(
+            f"[yellow]zep graph still growing after {ZEP_GRAPH_SETTLE_TIMEOUT_SEC:.0f}s "
+            f"for {conversation_id}; proceeding anyway."
+        )
 
     def answer(self, conversation_id: str, question: str) -> AnswerResult:
         thread_id = _thread_id_for(conversation_id)
