@@ -120,11 +120,6 @@ def run_bench(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     already_done = _load_completed_keys(output_path)
-    if already_done:
-        console.print(
-            f"[yellow]Resume mode:[/] {len(already_done)} result rows already in "
-            f"{output_path} — skipping those."
-        )
 
     judge_llm = llm or LlmClient()
     judge_model = resolve_judge_model()
@@ -134,6 +129,35 @@ def run_bench(
     # cost is fine.
     convs = list(conversations)
     total_questions = sum(len(c.qa) for c in convs) * len(systems)
+
+    # Per-system resume breakdown: thin "23 rows already" messages
+    # let stale-state bugs (IDE buffer overwriting the JSONL, an old
+    # archive being read, schema drift) hide for minutes before the
+    # operator notices the bench is redoing finished work. The
+    # per-system breakdown surfaces the plan up front so a mismatch
+    # against expectations is visible in the first second of output.
+    if already_done or total_questions:
+        planned_per_system = {s.name: sum(len(c.qa) for c in convs) for s in systems}
+        done_per_system: dict[str, int] = {s.name: 0 for s in systems}
+        for sys_name, _conv_id, _q_idx in already_done:
+            if sys_name in done_per_system:
+                done_per_system[sys_name] += 1
+        planned_remaining = total_questions - sum(done_per_system.values())
+        console.print(
+            f"[bold]Plan:[/] {planned_remaining} of {total_questions} question-runs "
+            f"remaining across {len(systems)} system(s)"
+            + (f"; {sum(done_per_system.values())} already done." if already_done else ".")
+        )
+        for s in systems:
+            planned = planned_per_system[s.name]
+            done = done_per_system[s.name]
+            remaining = planned - done
+            status = (
+                "[green]done[/]"
+                if remaining == 0
+                else f"{remaining} remaining" + (f" ([yellow]{done} done[/])" if done else "")
+            )
+            console.print(f"  - {s.name}: {status}")
 
     with (
         output_path.open("a", encoding="utf-8") as out_fh,

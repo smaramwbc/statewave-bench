@@ -1,10 +1,16 @@
 """`swb` — the bench CLI.
 
-Three subcommands cover the operator workflow:
+Four subcommands cover the operator workflow:
 
-  swb config check         — verify env vars + API reachability before
+  swb config-check         — verify env vars + API reachability before
                               the bench burns tokens
   swb run [--limit N]      — execute the bench, stream results to JSONL
+                              (fresh by default; pass --resume to keep
+                              the prior file and skip done tuples)
+  swb rescore              — recompute the score + metric columns in an
+                              existing JSONL using the current metric
+                              module (e.g. after expanding LLM-judge
+                              categories) without re-running the bench
   swb report               — read JSONL → summary + charts
 
 Each subcommand is independent; operators can mix-and-match (run a
@@ -225,7 +231,26 @@ def _print_cost_estimate(est: CostEstimate) -> None:
     "-o",
     type=click.Path(dir_okay=False, path_type=Path),
     default=Path("results/run.jsonl"),
-    help="Where to stream JSONL results. Resumable across runs.",
+    help=(
+        "Where to stream JSONL results. By default, an existing file at "
+        "this path is deleted before this run starts so every run "
+        "exercises the full delete -> ingest -> compile -> retrieve -> "
+        "answer chain. Pass --resume to keep the existing file and skip "
+        "already-done (system, conv, q_idx) tuples."
+    ),
+)
+@click.option(
+    "--resume",
+    "resume",
+    is_flag=True,
+    default=False,
+    help=(
+        "Skip already-completed (system, conversation, question) tuples "
+        "found in --output instead of deleting and starting fresh. Useful "
+        "for the full ~10-conversation run that takes hours and might hit "
+        "transient errors; not what you want for iterative testing of "
+        "fixes to the memory pipeline."
+    ),
 )
 @click.option(
     "--cache-dir",
@@ -237,6 +262,7 @@ def run(
     systems: tuple[str, ...],
     limit: int | None,
     output: Path,
+    resume: bool,
     cache_dir: Path,
 ) -> None:
     from .runner import run_bench  # imported here so `swb --help` doesn't pay the cost
@@ -251,6 +277,21 @@ def run(
     if not instances:
         console.print("[red]No systems instantiated. Aborting.[/]")
         sys.exit(2)
+
+    # Fresh-by-default. The full chain — delete_subject() in every
+    # adapter, re-ingest, re-compile, re-retrieve, re-answer, re-score —
+    # only fires when the JSONL is empty for a given (system, conv) tuple.
+    # Carrying stale rows from a prior run means the bench short-circuits
+    # the ingest/compile path and you're not actually testing fixes to
+    # those layers. --resume opts back in to the resumable behavior.
+    if output.exists() and not resume:
+        output.unlink()
+        console.print(f"[yellow]Fresh run:[/] deleted previous {output}")
+    elif output.exists() and resume:
+        console.print(
+            "[yellow]Resume mode:[/] keeping existing results; "
+            "already-done (system, conv, q_idx) tuples will be skipped."
+        )
 
     console.print(f"Running {len(instances)} system(s): {', '.join(s.name for s in instances)}")
     if limit:
@@ -284,6 +325,92 @@ def report(input_path: Path, output_dir: Path) -> None:
     render_report(results_path=input_path, output_dir=output_dir)
     console.print(f"[green]Report written:[/] {output_dir}/results-summary.md")
     console.print(f"  charts: {output_dir}/results-overall.html, results-by-category.html")
+
+
+# ── `swb rescore` ─────────────────────────────────────────────────────────
+
+
+@main.command("rescore", help="Recompute scores in a JSONL using the current metric module.")
+@click.option(
+    "--input",
+    "-i",
+    "input_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=Path("results/run.jsonl"),
+    help="JSONL file to re-score. Must contain question/category/ground_truth/prediction.",
+)
+@click.option(
+    "--output",
+    "-o",
+    "output_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Where to write the re-scored JSONL. Default: overwrite input.",
+)
+def rescore(input_path: Path, output_path: Path | None) -> None:
+    """Recompute the `score` + `metric` columns for every row in a
+    results JSONL using the current metric module. Useful after a
+    methodology change (e.g. expanding LLM-judge categories) where
+    re-running the bench would be wasteful — predictions are already
+    captured, only the scoring path changed.
+
+    Atomic write: new content goes to a temp file, then renamed over
+    the destination so a Ctrl-C mid-write doesn't corrupt the file.
+    """
+    import json
+    import tempfile
+
+    from .llm import LlmClient, resolve_judge_model
+    from .metrics import score_answer
+
+    out = output_path or input_path
+    llm = LlmClient()
+    judge_model = resolve_judge_model()
+
+    rows: list[dict[str, object]] = []
+    with input_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+
+    console.print(f"Re-scoring {len(rows)} row(s) from {input_path}…")
+    judge_calls = 0
+    metric_changes = 0
+    for i, row in enumerate(rows, start=1):
+        new_score = score_answer(
+            question=str(row["question"]),
+            prediction=str(row["prediction"]),
+            ground_truth=str(row["ground_truth"]),
+            category=str(row["category"]),
+            llm=llm,
+            judge_model=judge_model,
+        )
+        if new_score.metric != row.get("metric"):
+            metric_changes += 1
+        if new_score.metric in ("llm_judge", "refusal_judge"):
+            judge_calls += 1
+        row["score"] = new_score.value
+        row["metric"] = new_score.metric
+        if i % 50 == 0 or i == len(rows):
+            console.print(f"  scored {i}/{len(rows)}…")
+
+    tmp_dir = out.parent
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", dir=tmp_dir, delete=False, suffix=".tmp", encoding="utf-8"
+    ) as tmp_fh:
+        tmp_path = Path(tmp_fh.name)
+        for row in rows:
+            tmp_fh.write(json.dumps(row) + "\n")
+    tmp_path.replace(out)
+
+    console.print(
+        f"[green]Re-scored:[/] {len(rows)} rows -> {out}\n"
+        f"  judge calls made: {judge_calls}\n"
+        f"  rows whose metric changed: {metric_changes}"
+    )
 
 
 # ── System registry ───────────────────────────────────────────────────────

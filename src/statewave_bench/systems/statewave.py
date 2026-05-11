@@ -40,8 +40,10 @@ EPISODE_SOURCE = "statewave-bench"
 EPISODE_TYPE = "conversation"
 
 # Cap the context bundle we ask Statewave to assemble per question.
-# 2K tokens is generous — most LoCoMo questions need a few facts plus
-# a session excerpt or two; 8K would just inflate cost without
+# 2K is the empirical sweet spot on LoCoMo: dropping to 512 regressed
+# multi_hop, temporal, AND open_domain (the latter was the experiment
+# motivation — Mem0's win there is not driven by bundle size, see
+# README methodology notes), and 8K would just inflate cost without
 # improving recall on this dataset.
 DEFAULT_CONTEXT_MAX_TOKENS = 2048
 
@@ -194,19 +196,42 @@ class StatewaveSystem(MemorySystem):
         subject_id = _subject_for(conversation_id)
         start = time.perf_counter()
 
-        # Step 1: retrieve a ranked context bundle.
-        bundle = self._client.get_context(
-            subject_id,
-            task=question,
-            max_tokens=DEFAULT_CONTEXT_MAX_TOKENS,
-        )
+        # Step 1: retrieve context. Default is the full ranked bundle.
+        #
+        # Experimental opt-in (env var STATEWAVE_BENCH_FACTS_ONLY=1):
+        # call search_memories with kind="profile_fact" and a semantic
+        # query, format the top-K results as a compact fact list. This
+        # tests the hypothesis that Mem0 wins LoCoMo open_domain via
+        # bundle SHAPE (granular fact list) not bundle size — Mem0
+        # only emits flat fact-list memories; Statewave's default
+        # bundle blends profile_fact with episode_summary, which adds
+        # conversational paraphrase that hurts on synthesis questions.
+        # Revert by unsetting the env var; no code change needed.
+        if os.environ.get("STATEWAVE_BENCH_FACTS_ONLY") == "1":
+            search = self._client.search_memories(
+                subject_id,
+                kind="profile_fact",
+                query=question,
+                semantic=True,
+                limit=20,
+            )
+            context = "\n".join(f"- {m.content}" for m in search.memories) or (
+                "(no relevant memories found)"
+            )
+        else:
+            bundle = self._client.get_context(
+                subject_id,
+                task=question,
+                max_tokens=DEFAULT_CONTEXT_MAX_TOKENS,
+            )
+            context = bundle.assembled_context
 
-        # Step 2: prompt the shared answer model with the bundle.
+        # Step 2: prompt the shared answer model with the context.
         model = resolve_answer_model()
         prompt = (
             "Answer the question using the context below. If the answer "
             "isn't in the context, say so honestly — do not fabricate.\n\n"
-            f"--- Context ---\n{bundle.assembled_context}\n\n"
+            f"--- Context ---\n{context}\n\n"
             f"--- Question ---\n{question}"
         )
         result = self._llm.complete(
@@ -223,7 +248,7 @@ class StatewaveSystem(MemorySystem):
             answer_input_tokens=result.input_tokens,
             answer_output_tokens=result.output_tokens,
             elapsed_ms=elapsed_ms,
-            retrieved_context=bundle.assembled_context,
+            retrieved_context=context,
             # Statewave reports its own LLM-compile cost via server
             # logs / metrics; the bundle response itself doesn't carry
             # it, so we leave the internal-cost fields at 0 and document

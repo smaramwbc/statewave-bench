@@ -1,24 +1,33 @@
 """Scoring metrics for LoCoMo answers.
 
-LoCoMo questions split into two scoring regimes:
+LoCoMo questions split into three scoring regimes (aligned with the
+paper's reference evaluator — Section 4.2 of *Evaluating Very Long-Term
+Conversational Memory of LLM Agents*, Snap Research 2024):
 
-  1. **Exact-answer questions** — the ground-truth answer is short
-     and unambiguous (a name, a date, a number). We score with token-
-     level F1, the standard SQuAD-derived metric: tokens are
-     normalized (lowercased, stripped of punctuation/articles), then
-     precision + recall + F1 are computed against the prediction.
-     Identical to LoCoMo's official evaluation script and to the
-     SQuAD reference implementation.
+  1. **Short factoid (`single_hop`)** — ground truth is a name, date,
+     or number. Scored with token-level F1 (SQuAD-style normalization).
+     F1 is appropriate here because the truth is unambiguous and any
+     correct answer overlaps the truth tokens.
 
-  2. **Open-ended questions** — the answer can be phrased many ways.
-     String-matching here would systematically penalize long
-     paraphrases. We use LLM-as-judge: a separate model (the
-     `judge_model`, deliberately different from the answer model) is
-     asked "is this prediction equivalent to the ground truth, given
-     the question?" and returns a 0/1 verdict.
+  2. **Reasoning / open-ended (`multi_hop`, `temporal`, `open_domain`,
+     `open_ended`)** — ground truth is a natural-language explanation
+     ("Likely no; though she likes reading…"). F1 systematically
+     penalizes verbose-but-correct paraphrases here — the model can
+     answer correctly and still score ~0.10 because of low token
+     overlap with the reference phrasing. We use LLM-as-judge: a
+     separate model decides whether the prediction is semantically
+     equivalent to the ground truth.
+
+  3. **Adversarial** — the question asks about something not in the
+     conversation; the correct behavior is to refuse. Ground truth is
+     an empty string. Standard F1 returns 0 against any non-empty
+     refusal text, which means EVERY correct refusal scores zero —
+     a metric bug that previously made all systems look bad on this
+     category. We use a refusal-detection judge: 1.0 if the prediction
+     refuses to answer, 0.0 if it fabricates one.
 
 Per-category aggregation: LoCoMo categorizes each question, so we
-report F1 per-category alongside the overall score. A system that
+report scores per-category alongside the overall mean. A system that
 crushes single-session questions but bombs temporal reasoning
 shouldn't get to hide that under one global number.
 """
@@ -32,10 +41,23 @@ from dataclasses import dataclass
 
 from .llm import LlmClient
 
-# LoCoMo categories that should be scored with LLM-as-judge rather
-# than F1. The category names match upstream's labels; categories not
-# listed default to F1.
-LLM_JUDGE_CATEGORIES = frozenset({"open_domain", "open_ended"})
+# Categories where the right metric is semantic equivalence (LLM-judge),
+# not token overlap. Empirically, F1 systematically under-rates correct
+# verbose answers on these — see the docstring above for the paper's
+# methodology alignment.
+LLM_JUDGE_CATEGORIES = frozenset(
+    {
+        "open_domain",
+        "open_ended",
+        "multi_hop",
+        "temporal",
+    }
+)
+
+# Categories where the correct behavior is to refuse — ground truth is
+# empty, F1 against empty truth always returns 0 for any non-empty
+# prediction. We route these through a refusal-detection judge.
+REFUSAL_CATEGORIES = frozenset({"adversarial"})
 
 
 # ── Public types ──────────────────────────────────────────────────────────
@@ -49,7 +71,7 @@ class Score:
     the LLM-judged subset)."""
 
     value: float
-    metric: str  # "f1" | "llm_judge"
+    metric: str  # "f1" | "llm_judge" | "refusal_judge"
 
 
 # ── F1 (SQuAD-style) ──────────────────────────────────────────────────────
@@ -138,6 +160,51 @@ def llm_judge(
     return 0.0
 
 
+# ── Refusal judge (adversarial) ───────────────────────────────────────────
+
+_REFUSAL_JUDGE_SYSTEM = (
+    "You are evaluating whether an answer correctly refuses a question that "
+    "the model should NOT be able to answer (the relevant facts are not in "
+    "its context).\n"
+    "\n"
+    "Reply with EXACTLY one of:\n"
+    "  REFUSAL — the prediction declines to answer, says the information "
+    "isn't available, isn't in the context, or acknowledges uncertainty "
+    "rather than committing to a fact.\n"
+    "  FABRICATION — the prediction commits to a specific factual answer "
+    "(name, date, place, action, attribute) as if it were known.\n"
+    "\n"
+    "Hedged refusals still count as REFUSAL (e.g. 'the context doesn't "
+    "mention X, but Y is a related fact'). The key is whether the model "
+    "claimed a factual answer to the question being asked."
+)
+
+_REFUSAL_JUDGE_USER_TEMPLATE = "Question: {question}\nPrediction: {prediction}\n\nVerdict:"
+
+
+def llm_judge_refusal(
+    *,
+    question: str,
+    prediction: str,
+    llm: LlmClient,
+    model: str,
+) -> float:
+    """Score an adversarial answer. Returns 1.0 if the prediction
+    refuses to answer (correct behavior — the fact isn't in the
+    conversation), 0.0 if it fabricates a specific answer."""
+    result = llm.complete(
+        model=model,
+        system=_REFUSAL_JUDGE_SYSTEM,
+        user=_REFUSAL_JUDGE_USER_TEMPLATE.format(question=question, prediction=prediction),
+        max_tokens=8,
+        temperature=0.0,
+    )
+    verdict = result.answer.strip().upper()
+    if "REFUSAL" in verdict and "FABRICATION" not in verdict:
+        return 1.0
+    return 0.0
+
+
 # ── Dispatch ──────────────────────────────────────────────────────────────
 
 
@@ -153,6 +220,14 @@ def score_answer(
     """Score one answer, picking the right metric for the question
     category. Caller passes a shared `llm` so judge calls reuse the
     same client + cache."""
+    if category in REFUSAL_CATEGORIES:
+        value = llm_judge_refusal(
+            question=question,
+            prediction=prediction,
+            llm=llm,
+            model=judge_model,
+        )
+        return Score(value=value, metric="refusal_judge")
     if category in LLM_JUDGE_CATEGORIES:
         value = llm_judge(
             question=question,
