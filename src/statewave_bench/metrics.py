@@ -36,10 +36,99 @@ from __future__ import annotations
 
 import re
 import string
+import time
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TypeVar
 
-from .llm import LlmClient
+from .llm import LlmCall, LlmClient
+
+
+class JudgeQuotaExhausted(RuntimeError):
+    """The judge provider reports the operator's quota / credit balance
+    is exhausted. Retries won't help — every subsequent judge call would
+    fail the same way, and burning more answer-model spend on questions
+    that can't be scored is wasteful. The runner catches this at the
+    top level and halts the bench cleanly so the operator can refill
+    and re-run with --resume.
+
+    Triggered by provider error messages containing:
+      - `insufficient_quota`    (OpenAI)
+      - `quota_exceeded`        (OpenAI variant)
+      - `credit balance is too low`  (Anthropic)
+      - `billing_quota_exceeded`     (other)
+    """
+
+
+# Provider error-body markers that indicate "no more credits / quota".
+# Matched case-insensitively against str(exc).
+_QUOTA_MARKERS: tuple[str, ...] = (
+    "insufficient_quota",
+    "quota_exceeded",
+    "billing_quota_exceeded",
+    "credit balance is too low",
+)
+
+
+# Patterns that indicate the failure is transient and worth retrying.
+# Provider 5xx (server overload), 429 without quota markers (rate limit),
+# connection-level failures, timeouts. Matched against str(exc).
+_TRANSIENT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bError code:\s*5\d\d\b", re.IGNORECASE),
+    re.compile(r"\bError code:\s*429\b", re.IGNORECASE),
+    re.compile(r"\bConnectionError\b", re.IGNORECASE),
+    re.compile(r"\bRemoteProtocolError\b", re.IGNORECASE),
+    re.compile(r"\bAPITimeoutError\b", re.IGNORECASE),
+    re.compile(r"\bAPIConnectionError\b", re.IGNORECASE),
+    re.compile(r"\btimed?\s*out\b", re.IGNORECASE),
+)
+
+
+def _is_quota_error(err: BaseException) -> bool:
+    s = str(err).lower()
+    return any(marker.lower() in s for marker in _QUOTA_MARKERS)
+
+
+def _is_transient(err: BaseException) -> bool:
+    s = str(err)
+    return any(p.search(s) for p in _TRANSIENT_PATTERNS)
+
+
+T = TypeVar("T")
+
+
+def _call_judge_with_retry(
+    fn: Callable[[], T],
+    *,
+    max_attempts: int = 3,
+    initial_backoff_sec: float = 1.0,
+    backoff_multiplier: float = 4.0,
+) -> T:
+    """Call `fn`, retrying on transient errors with exponential backoff.
+
+    - Quota errors short-circuit immediately as JudgeQuotaExhausted.
+    - Transient errors (5xx, 429-without-quota, connection/timeout) get
+      up to `max_attempts` tries with backoff 1s -> 4s -> 16s.
+    - Non-transient errors (4xx, parse failures, etc.) re-raise on the
+      first occurrence.
+    """
+    backoff = initial_backoff_sec
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if _is_quota_error(e):
+                raise JudgeQuotaExhausted(str(e)) from e
+            if attempt < max_attempts and _is_transient(e):
+                time.sleep(backoff)
+                backoff *= backoff_multiplier
+                continue
+            raise
+    # Unreachable — the loop always either returns or raises — but mypy
+    # can't see it, so close the function explicitly.
+    raise RuntimeError("retry loop exhausted without returning or raising")
+
 
 # Categories where the right metric is semantic equivalence (LLM-judge),
 # not token overlap. Empirically, F1 systematically under-rates correct
@@ -142,16 +231,25 @@ def llm_judge(
     """Score an open-ended answer via a separate LLM. Returns 1.0 if
     the judge says CORRECT, 0.0 otherwise. The judge model is
     deliberately different from the answer model (config'd in
-    llm.py) to reduce same-model-bias."""
-    result = llm.complete(
-        model=model,
-        system=_JUDGE_SYSTEM,
-        user=_JUDGE_USER_TEMPLATE.format(
-            question=question, truth=ground_truth, prediction=prediction
-        ),
-        max_tokens=8,
-        temperature=0.0,
-    )
+    llm.py) to reduce same-model-bias.
+
+    Wrapped in `_call_judge_with_retry` — transient OpenAI 5xx /
+    Anthropic 529 / connection failures are retried with backoff;
+    quota exhaustion short-circuits as JudgeQuotaExhausted.
+    """
+
+    def _call() -> LlmCall:
+        return llm.complete(
+            model=model,
+            system=_JUDGE_SYSTEM,
+            user=_JUDGE_USER_TEMPLATE.format(
+                question=question, truth=ground_truth, prediction=prediction
+            ),
+            max_tokens=8,
+            temperature=0.0,
+        )
+
+    result = _call_judge_with_retry(_call)
     verdict = result.answer.strip().upper()
     # Be permissive on the parse — if the judge tacks on punctuation
     # or wraps the verdict, look for the keyword anywhere.
@@ -191,14 +289,21 @@ def llm_judge_refusal(
 ) -> float:
     """Score an adversarial answer. Returns 1.0 if the prediction
     refuses to answer (correct behavior — the fact isn't in the
-    conversation), 0.0 if it fabricates a specific answer."""
-    result = llm.complete(
-        model=model,
-        system=_REFUSAL_JUDGE_SYSTEM,
-        user=_REFUSAL_JUDGE_USER_TEMPLATE.format(question=question, prediction=prediction),
-        max_tokens=8,
-        temperature=0.0,
-    )
+    conversation), 0.0 if it fabricates a specific answer.
+
+    Same retry semantics as `llm_judge`.
+    """
+
+    def _call() -> LlmCall:
+        return llm.complete(
+            model=model,
+            system=_REFUSAL_JUDGE_SYSTEM,
+            user=_REFUSAL_JUDGE_USER_TEMPLATE.format(question=question, prediction=prediction),
+            max_tokens=8,
+            temperature=0.0,
+        )
+
+    result = _call_judge_with_retry(_call)
     verdict = result.answer.strip().upper()
     if "REFUSAL" in verdict and "FABRICATION" not in verdict:
         return 1.0

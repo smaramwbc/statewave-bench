@@ -15,6 +15,10 @@ import pytest
 
 from statewave_bench.metrics import (
     LLM_JUDGE_CATEGORIES,
+    JudgeQuotaExhausted,
+    _call_judge_with_retry,
+    _is_quota_error,
+    _is_transient,
     f1,
     normalize_text,
 )
@@ -79,3 +83,118 @@ def test_llm_judge_categories_is_immutable() -> None:
     assert isinstance(LLM_JUDGE_CATEGORIES, frozenset)
     assert "open_domain" in LLM_JUDGE_CATEGORIES
     assert "open_ended" in LLM_JUDGE_CATEGORIES
+
+
+# ── Judge retry / quota detection ─────────────────────────────────────────
+
+
+class TestErrorClassification:
+    """Provider error strings -> right routing decision. The actual
+    messages come from real OpenAI/Anthropic SDK exceptions seen in
+    bench runs."""
+
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            "Error code: 429 - {'error': {'message': 'You exceeded your current "
+            "quota...', 'type': 'insufficient_quota'}}",
+            "Error code: 400 - {'error': {'message': 'Your credit balance is too "
+            "low to access the Anthropic API'}}",
+            "billing_quota_exceeded: see plan",
+        ],
+    )
+    def test_quota_markers_detected(self, msg: str) -> None:
+        assert _is_quota_error(RuntimeError(msg))
+
+    def test_quota_not_falsely_flagged(self) -> None:
+        # 500 server errors mention "error" but aren't quota
+        assert not _is_quota_error(RuntimeError("Error code: 500 - server_error"))
+
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            "Error code: 500 - server had an error",
+            "Error code: 503 - service unavailable",
+            "Error code: 429 - rate limit (no quota marker)",
+            "APITimeoutError: request timed out",
+            "ConnectionError: connection refused",
+        ],
+    )
+    def test_transient_patterns_detected(self, msg: str) -> None:
+        assert _is_transient(RuntimeError(msg))
+
+    def test_non_transient_not_flagged(self) -> None:
+        # 400 (bad request), 401 (auth), 404 (not found) are permanent.
+        assert not _is_transient(RuntimeError("Error code: 400 - bad request"))
+        assert not _is_transient(RuntimeError("Error code: 401 - unauthorized"))
+        assert not _is_transient(RuntimeError("ValueError: bad input"))
+
+
+class TestCallJudgeWithRetry:
+    """The retry helper's behavior under the four outcomes that matter."""
+
+    def test_success_first_try(self) -> None:
+        call_count = 0
+
+        def fn() -> str:
+            nonlocal call_count
+            call_count += 1
+            return "ok"
+
+        assert _call_judge_with_retry(fn) == "ok"
+        assert call_count == 1
+
+    def test_retries_transient_then_succeeds(self) -> None:
+        call_count = 0
+
+        def fn() -> str:
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise RuntimeError("Error code: 500 - server overload")
+            return "ok"
+
+        # Use 0 backoff so the test is fast.
+        result = _call_judge_with_retry(fn, initial_backoff_sec=0.0)
+        assert result == "ok"
+        assert call_count == 3
+
+    def test_exhausts_retries_then_reraises(self) -> None:
+        call_count = 0
+
+        def fn() -> str:
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError("Error code: 500 - persistent")
+
+        with pytest.raises(RuntimeError, match="500"):
+            _call_judge_with_retry(fn, initial_backoff_sec=0.0)
+        assert call_count == 3  # max_attempts default
+
+    def test_quota_short_circuits_no_retry(self) -> None:
+        """Quota errors must NOT retry — every subsequent call would
+        fail the same way and burn more answer-model spend."""
+        call_count = 0
+
+        def fn() -> str:
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError("Error code: 429 - {'error': {'type': 'insufficient_quota'}}")
+
+        with pytest.raises(JudgeQuotaExhausted):
+            _call_judge_with_retry(fn, initial_backoff_sec=0.0)
+        assert call_count == 1
+
+    def test_non_transient_does_not_retry(self) -> None:
+        """4xx (bad request, auth) shouldn't be retried — they're
+        permanent until something changes."""
+        call_count = 0
+
+        def fn() -> str:
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError("Error code: 400 - bad request")
+
+        with pytest.raises(RuntimeError, match="400"):
+            _call_judge_with_retry(fn, initial_backoff_sec=0.0)
+        assert call_count == 1
