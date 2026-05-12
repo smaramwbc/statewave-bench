@@ -36,7 +36,7 @@ from rich.progress import (
 
 from .dataset import LocomoConversation, LocomoQA
 from .llm import LlmClient, resolve_judge_model
-from .metrics import Score, score_answer
+from .metrics import JudgeQuotaExhausted, Score, score_answer
 from .systems.base import AnswerResult, MemorySystem
 
 console = Console()
@@ -83,6 +83,49 @@ def _result_record(
         "internal_input_tokens": answer.internal_input_tokens,
         "internal_output_tokens": answer.internal_output_tokens,
     }
+
+
+def _result_record_judge_failed(
+    *,
+    system: str,
+    conversation_id: str,
+    question_idx: int,
+    qa: LocomoQA,
+    answer: AnswerResult,
+    judge_error: str,
+) -> dict[str, Any]:
+    """JSONL row for a question whose answer succeeded but whose judge
+    call failed (transient that survived retries). `score` is null and
+    `metric` is "judge_failed" so `swb rescore` can detect and retry
+    these rows; the `judge_error` field carries the short error so
+    operators can spot patterns (one provider misbehaving, etc.).
+    The report's polars aggregation skips null scores cleanly.
+    """
+    return {
+        "system": system,
+        "conversation_id": conversation_id,
+        "question_idx": question_idx,
+        "question": qa.question,
+        "category": qa.category,
+        "ground_truth": qa.answer,
+        "prediction": answer.answer,
+        "score": None,
+        "metric": "judge_failed",
+        "judge_error": judge_error,
+        "elapsed_ms": answer.elapsed_ms,
+        "answer_model": answer.answer_model,
+        "answer_input_tokens": answer.answer_input_tokens,
+        "answer_output_tokens": answer.answer_output_tokens,
+        "internal_input_tokens": answer.internal_input_tokens,
+        "internal_output_tokens": answer.internal_output_tokens,
+    }
+
+
+def _short(err: BaseException) -> str:
+    s = str(err)
+    if len(s) > 200:
+        s = s[:200] + "…"
+    return s.replace("\n", " ")
 
 
 # ── Resumability ──────────────────────────────────────────────────────────
@@ -233,18 +276,36 @@ def run_bench(
                         task,
                         stage=f"{system.name} / {conv.id} (q {q_idx + 1}/{len(conv.qa)})",
                     )
-                    record = _run_one_question(
-                        system=system,
-                        conv_id=conv.id,
-                        q_idx=q_idx,
-                        qa=qa,
-                        judge_llm=judge_llm,
-                        judge_model=judge_model,
-                    )
+                    try:
+                        record = _run_one_question(
+                            system=system,
+                            conv_id=conv.id,
+                            q_idx=q_idx,
+                            qa=qa,
+                            judge_llm=judge_llm,
+                            judge_model=judge_model,
+                        )
+                    except JudgeQuotaExhausted as e:
+                        console.print(
+                            "\n[red]Judge quota exhausted:[/] "
+                            f"{_short(e)}\n"
+                            "Every subsequent judge call would fail the same "
+                            "way and burning more answer-model spend is wasteful, "
+                            "so the bench is halting now. Refill your judge "
+                            "provider account and re-run with `--resume` to pick "
+                            "up where we stopped."
+                        )
+                        progress.update(task, stage="halted (judge quota)")
+                        return
                     if record is None:
                         failure_streak += 1
                     else:
-                        failure_streak = 0  # one success resets the breaker
+                        # Any complete-row write resets the breaker — even
+                        # rows where only the judge failed (the answer model
+                        # is healthy, which is what the breaker actually
+                        # guards). The runner already retried judge
+                        # transients with backoff inside score_answer.
+                        failure_streak = 0
                         out_fh.write(json.dumps(record) + "\n")
                         out_fh.flush()
                     progress.update(task, advance=1)
@@ -262,9 +323,25 @@ def _run_one_question(
     judge_model: str,
 ) -> dict[str, Any] | None:
     """Ask one question, score the answer, return a JSONL row.
-    Returns None on failure (failure is logged; caller advances
-    the progress bar and moves on rather than aborting the whole
-    run on one bad question)."""
+
+    Three outcomes:
+      - Answer + score both succeed: returns a complete row.
+      - Answer succeeds, scoring fails (transient judge errors that
+        survived the retry path): returns a row with `score: null`,
+        `metric: "judge_failed"`, and a `judge_error` field. The row
+        IS written to the JSONL; `swb rescore` can retry the judge
+        later without re-running the answer phase. The failure-streak
+        circuit-breaker does NOT count this as a failure — the answer
+        model is healthy, only the judge is flaky.
+      - Answer fails: returns None. The runner increments the
+        failure-streak counter; 3 in a row aborts the conversation
+        for that system.
+
+    Judge-quota exhaustion (insufficient_quota / credit balance is
+    too low) propagates as `JudgeQuotaExhausted`; the runner catches
+    it at the top level and halts the whole bench so the operator
+    can refill before more answer-model spend is wasted.
+    """
     try:
         start = time.perf_counter()
         answer = system.answer(conv_id, qa.question)
@@ -287,9 +364,27 @@ def _run_one_question(
             llm=judge_llm,
             judge_model=judge_model,
         )
+    except JudgeQuotaExhausted:
+        # Propagate — handled at the run_bench level so the whole
+        # bench halts (every subsequent judge call would fail the same
+        # way, retries don't help, more answer-model spend is wasted).
+        raise
     except Exception as e:
-        console.print(f"[red]Scoring failed[/] (conv={conv_id}, q={q_idx}): {e}")
-        return None
+        # Answer is in hand; only scoring failed. Preserve the row
+        # with null score + judge_error so `swb rescore` can retry the
+        # judge later without re-spending on the answer model.
+        console.print(
+            f"[yellow]Judge failed[/] (system={system.name}, conv={conv_id}, q={q_idx}): "
+            f"{_short(e)} — row stored with null score; run `swb rescore` later."
+        )
+        return _result_record_judge_failed(
+            system=system.name,
+            conversation_id=conv_id,
+            question_idx=q_idx,
+            qa=qa,
+            answer=answer,
+            judge_error=_short(e),
+        )
 
     return _result_record(
         system=system.name,

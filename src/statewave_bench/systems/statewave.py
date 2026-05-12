@@ -196,35 +196,13 @@ class StatewaveSystem(MemorySystem):
         subject_id = _subject_for(conversation_id)
         start = time.perf_counter()
 
-        # Step 1: retrieve context. Default is the full ranked bundle.
-        #
-        # Experimental opt-in (env var STATEWAVE_BENCH_FACTS_ONLY=1):
-        # call search_memories with kind="profile_fact" and a semantic
-        # query, format the top-K results as a compact fact list. This
-        # tests the hypothesis that Mem0 wins LoCoMo open_domain via
-        # bundle SHAPE (granular fact list) not bundle size — Mem0
-        # only emits flat fact-list memories; Statewave's default
-        # bundle blends profile_fact with episode_summary, which adds
-        # conversational paraphrase that hurts on synthesis questions.
-        # Revert by unsetting the env var; no code change needed.
-        if os.environ.get("STATEWAVE_BENCH_FACTS_ONLY") == "1":
-            search = self._client.search_memories(
-                subject_id,
-                kind="profile_fact",
-                query=question,
-                semantic=True,
-                limit=20,
-            )
-            context = "\n".join(f"- {m.content}" for m in search.memories) or (
-                "(no relevant memories found)"
-            )
-        else:
-            bundle = self._client.get_context(
-                subject_id,
-                task=question,
-                max_tokens=DEFAULT_CONTEXT_MAX_TOKENS,
-            )
-            context = bundle.assembled_context
+        # Step 1: retrieve the ranked context bundle.
+        bundle = self._client.get_context(
+            subject_id,
+            task=question,
+            max_tokens=DEFAULT_CONTEXT_MAX_TOKENS,
+        )
+        context = bundle.assembled_context
 
         # Step 2: prompt the shared answer model with the context.
         model = resolve_answer_model()

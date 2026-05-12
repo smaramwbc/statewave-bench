@@ -26,7 +26,10 @@ dist/
 # `!results/published/` here (or whatever subdir you choose).
 data/locomo/
 results/*.json
+results/*.jsonl
 results/*.csv
+results/*.html
+results/*.md
 results/charts/
 !results/.gitkeep
 !data/.gitkeep
