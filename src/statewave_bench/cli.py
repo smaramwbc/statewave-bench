@@ -323,8 +323,9 @@ def report(input_path: Path, output_dir: Path) -> None:
     from .report import render_report
 
     render_report(results_path=input_path, output_dir=output_dir)
-    console.print(f"[green]Report written:[/] {output_dir}/results-summary.md")
-    console.print(f"  charts: {output_dir}/results-overall.html, results-by-category.html")
+    console.print("[green]Report written:[/]")
+    console.print(f"  - {output_dir}/results-summary.md  (markdown table, paste into READMEs)")
+    console.print(f"  - {output_dir}/results.html        (combined modern report)")
 
 
 # ── `swb rescore` ─────────────────────────────────────────────────────────
