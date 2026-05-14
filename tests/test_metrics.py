@@ -13,15 +13,22 @@ from __future__ import annotations
 
 import pytest
 
-from statewave_bench.metrics import (
-    LLM_JUDGE_CATEGORIES,
-    JudgeQuotaExhausted,
-    _call_judge_with_retry,
+from statewave_bench.llm import (
+    ProviderQuotaExhausted,
     _is_quota_error,
     _is_transient,
+    call_with_retry,
+)
+from statewave_bench.metrics import (
+    LLM_JUDGE_CATEGORIES,
     f1,
     normalize_text,
 )
+
+# Tests below were written against the old metrics-side names. Keep
+# them passing via aliases so the test bodies don't need rewriting.
+JudgeQuotaExhausted = ProviderQuotaExhausted
+_call_judge_with_retry = call_with_retry
 
 
 class TestNormalizeText:
@@ -169,7 +176,7 @@ class TestCallJudgeWithRetry:
 
         with pytest.raises(RuntimeError, match="500"):
             _call_judge_with_retry(fn, initial_backoff_sec=0.0)
-        assert call_count == 3  # max_attempts default
+        assert call_count == 5  # max_attempts default
 
     def test_quota_short_circuits_no_retry(self) -> None:
         """Quota errors must NOT retry — every subsequent call would

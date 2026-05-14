@@ -32,7 +32,7 @@ import os
 import time
 
 from ..dataset import LocomoConversation
-from ..llm import LlmClient, resolve_answer_model
+from ..llm import LlmClient, make_qa_prompt, resolve_answer_model
 from .base import AnswerResult, HealthResult, MemorySystem
 
 SUBJECT_PREFIX = "bench:locomo:"
@@ -196,22 +196,144 @@ class StatewaveSystem(MemorySystem):
         subject_id = _subject_for(conversation_id)
         start = time.perf_counter()
 
-        # Step 1: retrieve the ranked context bundle.
-        bundle = self._client.get_context(
-            subject_id,
-            task=question,
-            max_tokens=DEFAULT_CONTEXT_MAX_TOKENS,
-        )
-        context = bundle.assembled_context
+        # Step 1: retrieve context. Default = full ranked `get_context`
+        # bundle (~2300 tokens, blends profile_fact + episode_summary).
+        #
+        # Experimental opt-in (env var STATEWAVE_BENCH_DIGEST=1): build
+        # a hybrid bundle = precomputed subject_digest + atomic facts +
+        # episode_summaries. Two shapes available via
+        # STATEWAVE_BENCH_DIGEST_MODE:
+        #
+        #   compact (default): digest + 5 facts + 2 summaries (~560 tok)
+        #     - Tuned for cost-sensitive deployments. Mean 0.452 macro
+        #       on the full LoCoMo bench under Honcho's verbatim judge.
+        #     - Wins multi_hop (digest's cross-fact synthesis); slightly
+        #       under-indexes open_domain (would benefit from more raw
+        #       conversational context).
+        #
+        #   fat: digest + 15 facts + 6 summaries (~2000 tok)
+        #     - Tuned to close the compression gap vs Honcho's full-
+        #       context baseline (75.4% under the same judge). 4x the
+        #       tokens but expected to lift open_domain materially —
+        #       the categories that benefit most from broader raw
+        #       conversational context. Hypothesis: lifts overall macro
+        #       from 0.45 to 0.60+.
+        #
+        # The digest itself is a ~250-token coherent prose paragraph
+        # emitted once per compile by the LLM compiler (cross-fact
+        # identity, key dated events, themes, relationships,
+        # trajectory). Pre-computing that synthesis at compile lets
+        # retrieval ship a focused prompt instead of re-deriving it on
+        # every query.
+        #
+        # Previously-tried-and-rejected variant ("path-3"), an intent-
+        # routed bundle that diverted "when did X" questions to a
+        # summary-heavy shape, regressed multi_hop 6.5pp on the full
+        # bench because atomic facts already include absolute dates
+        # ("on 23 June 2023") — cutting facts to add summaries lost the
+        # precise temporal signal. Keep the balanced shape; the fat
+        # mode trades budget, not signal mix.
+        if os.environ.get("STATEWAVE_BENCH_DIGEST") == "1":
+            digest_mode = os.environ.get("STATEWAVE_BENCH_DIGEST_MODE", "compact").lower()
+            if digest_mode == "fat":
+                fact_limit, summary_limit, summary_trim_chars = 15, 6, 500
+            else:
+                # "compact" or any unrecognized value — fall back to the
+                # well-tested balanced bundle.
+                fact_limit, summary_limit, summary_trim_chars = 5, 2, 300
+
+            digest = self._client.search_memories(
+                subject_id,
+                kind="subject_digest",
+                limit=1,
+            )
+            facts = self._client.search_memories(
+                subject_id,
+                kind="profile_fact",
+                query=question,
+                semantic=True,
+                limit=fact_limit,
+            )
+            summaries = self._client.search_memories(
+                subject_id,
+                kind="episode_summary",
+                query=question,
+                semantic=True,
+                limit=summary_limit,
+            )
+            digest_sections: list[str] = []
+            if digest.memories:
+                digest_sections.append(f"## About the subject\n{digest.memories[0].content}")
+            if facts.memories:
+                fact_lines = "\n".join(f"- {m.content}" for m in facts.memories)
+                digest_sections.append(f"## Relevant facts\n{fact_lines}")
+            if summaries.memories:
+                # Trim each summary so a verbose paraphrase doesn't
+                # blow the budget. compact: 300 chars (~70 tok), fat:
+                # 500 chars (~120 tok) — fat mode wants more
+                # conversational detail per summary.
+                summary_lines = "\n".join(
+                    f"- {m.content[:summary_trim_chars]}" for m in summaries.memories
+                )
+                digest_sections.append(f"## Recent context\n{summary_lines}")
+            context = (
+                "\n\n".join(digest_sections) if digest_sections else "(no relevant memories found)"
+            )
+        # Experimental opt-in (env var STATEWAVE_BENCH_HYBRID=1): build
+        # a tighter "hybrid" bundle from two semantic searches —
+        # 15 profile_facts (granular, citable, the bulk of the signal
+        # on multi_hop) PLUS 3 episode_summaries (conversational
+        # paraphrase that helps the answer model bridge facts on open-
+        # ended questions). Empirically ~700-1000 tokens, ~3x cheaper
+        # than the default bundle while keeping the high-precision
+        # facts in the prompt. Built on the same `search_memories`
+        # primitive the FACTS_ONLY experiment used; the difference is
+        # we no longer drop episode_summaries entirely (FACTS_ONLY
+        # showed they do load-bearing work on synthesis questions).
+        # Revert by unsetting the env var.
+        elif os.environ.get("STATEWAVE_BENCH_HYBRID") == "1":
+            # Bumped summaries from 3 to 8 after the first hybrid test
+            # showed multi_hop regress 31% — 3 summaries wasn't enough
+            # synthesis context. 15 + 8 should land ~1100-1300 tokens,
+            # roughly half of the 2343-token default while preserving
+            # enough conversational paraphrase for the model to bridge
+            # facts. If multi_hop still regresses materially, the
+            # hybrid approach itself is wrong, not the count.
+            facts = self._client.search_memories(
+                subject_id,
+                kind="profile_fact",
+                query=question,
+                semantic=True,
+                limit=15,
+            )
+            summaries = self._client.search_memories(
+                subject_id,
+                kind="episode_summary",
+                query=question,
+                semantic=True,
+                limit=8,
+            )
+            fact_lines = "\n".join(f"- {m.content}" for m in facts.memories)
+            # Trim each summary so a verbose paraphrase doesn't blow
+            # the budget. ~300 chars ≈ 70-80 tokens.
+            summary_lines = "\n".join(f"- {m.content[:300]}" for m in summaries.memories)
+            sections: list[str] = []
+            if fact_lines:
+                sections.append(f"## Facts about the subject\n{fact_lines}")
+            if summary_lines:
+                sections.append(f"## Conversation context\n{summary_lines}")
+            context = "\n\n".join(sections) if sections else ("(no relevant memories found)")
+        else:
+            bundle = self._client.get_context(
+                subject_id,
+                task=question,
+                max_tokens=DEFAULT_CONTEXT_MAX_TOKENS,
+            )
+            context = bundle.assembled_context
 
         # Step 2: prompt the shared answer model with the context.
         model = resolve_answer_model()
-        prompt = (
-            "Answer the question using the context below. If the answer "
-            "isn't in the context, say so honestly — do not fabricate.\n\n"
-            f"--- Context ---\n{context}\n\n"
-            f"--- Question ---\n{question}"
-        )
+        prompt = make_qa_prompt(context=context, question=question)
         result = self._llm.complete(
             model=model,
             system=None,

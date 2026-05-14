@@ -31,7 +31,7 @@ import re
 import time
 
 from ..dataset import LocomoConversation
-from ..llm import LlmClient, resolve_answer_model
+from ..llm import LlmClient, make_qa_prompt, resolve_answer_model
 from .base import AnswerResult, HealthResult, MemorySystem
 
 # Mem0 user_id charset is alphanumeric + dash. LoCoMo ids are
@@ -48,7 +48,43 @@ def _user_id_for(conversation_id: str) -> str:
 # Mem0 search default. Their docs recommend top_k=5 for most retrieval
 # tasks; we match so we're benchmarking Mem0-as-recommended, not our
 # tuning. Documented in the README's methodology section.
+#
+# Override via `MEM0_TOP_K` env var to run a sweep without code changes
+# (e.g. `MEM0_TOP_K=20 swb run --systems mem0`). Sweep results published
+# alongside the headline number so readers can see Mem0's ceiling, not
+# just its default-config result.
 DEFAULT_TOP_K = 5
+
+# Mem0's add() is async — the response shape is
+#   {"message": "queued for background execution", "status": "PENDING",
+#    "event_id": "..."}
+# and the actual fact extraction runs on Mem0's side after the call
+# returns. Mem0's SDK doesn't expose a public wait/poll API on
+# `event_id`, so we settle by polling get_all() until the memory count
+# stops growing for N consecutive polls — same pattern as Zep's graph
+# settle. Without this, the bench's first answer() call races the
+# extractor queue and gets empty retrieval; that silently dragged
+# Mem0's multi_hop score to ~0.08 in the first --limit 10 run, where
+# 3 of 3 sampled misses literally returned "no relevant memories
+# found" because the queue hadn't drained.
+#
+# 3s poll x 3 stable polls = 9s of stability; 180s overall timeout is
+# generous — even dense LoCoMo sessions drain in 30-60s when Mem0 is
+# healthy. The timeout exists as a runaway-cost guard, not as the
+# expected exit.
+MEM0_SETTLE_POLL_SEC = 3.0
+MEM0_SETTLE_STABLE_COUNT = 3
+MEM0_SETTLE_TIMEOUT_SEC = 180.0
+
+
+def _resolve_top_k() -> int:
+    raw = os.environ.get("MEM0_TOP_K")
+    if not raw:
+        return DEFAULT_TOP_K
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_TOP_K
 
 
 class Mem0System(MemorySystem):
@@ -113,33 +149,72 @@ class Mem0System(MemorySystem):
                 }
                 for turn in session
             ]
-            try:
-                self._add(
-                    messages=messages,
-                    user_id=user_id,
-                    metadata={
-                        "session_id": session_idx,
-                        "bench": "locomo",
-                    },
-                )
-            except Exception as e:
-                # One failed session is recoverable — log + continue
-                # so the bench produces some signal rather than zero.
-                # The runner's per-question failure tolerance handles
-                # the downstream consequences.
-                from ..runner import console
+            # Per-session ingest exceptions propagate to the runner,
+            # which catches them at the (system, conv) boundary and
+            # drops the whole conversation for this system. Matches
+            # Statewave's compile-failure contract: a partial fact
+            # store would silently score against missing facts on
+            # every later question, which is worse than recording
+            # nothing — the leaderboard would then mix "Mem0 lost the
+            # question fairly" with "Mem0 never saw the fact." Better
+            # to fail loudly and let the operator rerun.
+            self._add(
+                messages=messages,
+                user_id=user_id,
+                metadata={
+                    "session_id": session_idx,
+                    "bench": "locomo",
+                },
+            )
 
-                console.print(
-                    f"[yellow]mem0 ingest failed for session {session_idx} "
-                    f"of {conversation.id}:[/] {e}"
-                )
+        # Block until Mem0's async fact extractor has drained its queue
+        # for this user_id. See MEM0_SETTLE_* constants for the
+        # rationale — without this wait the bench's first answer() call
+        # would race the extractor and retrieve nothing.
+        self._wait_for_extraction_settle(user_id=user_id, conversation_id=conversation.id)
+
+    def _wait_for_extraction_settle(self, *, user_id: str, conversation_id: str) -> None:
+        from ..runner import console
+
+        last_count: int | None = None
+        stable = 0
+        elapsed = 0.0
+        while elapsed < MEM0_SETTLE_TIMEOUT_SEC:
+            try:
+                result = self._get_all(user_id=user_id)
+            except Exception as e:
+                console.print(f"[yellow]mem0 settle-poll failed for {conversation_id}:[/] {e}")
+                return
+            # Result shape on cloud v2: {"results": [...]}; on self-hosted
+            # Memory: {"results": [...]} or {"memories": [...]}; sometimes
+            # just a bare list. Handle all three.
+            if isinstance(result, dict):
+                memories = result.get("results") or result.get("memories") or []
+            elif isinstance(result, list):
+                memories = result
+            else:
+                memories = []
+            count = len(memories)
+            if last_count is not None and count == last_count:
+                stable += 1
+                if stable >= MEM0_SETTLE_STABLE_COUNT:
+                    return
+            else:
+                stable = 0
+            last_count = count
+            time.sleep(MEM0_SETTLE_POLL_SEC)
+            elapsed += MEM0_SETTLE_POLL_SEC
+        console.print(
+            f"[yellow]mem0 extraction still growing after {MEM0_SETTLE_TIMEOUT_SEC:.0f}s "
+            f"for {conversation_id}; proceeding anyway."
+        )
 
     def answer(self, conversation_id: str, question: str) -> AnswerResult:
         user_id = _user_id_for(conversation_id)
         start = time.perf_counter()
 
         # Step 1: retrieve memories.
-        search_result = self._search(query=question, user_id=user_id, top_k=DEFAULT_TOP_K)
+        search_result = self._search(query=question, user_id=user_id, top_k=_resolve_top_k())
 
         # The SDK returns either {"results": [...]} (cloud v2 shape)
         # or just [...] (older / self-hosted). Handle both.
@@ -165,12 +240,7 @@ class Mem0System(MemorySystem):
 
         # Step 2: prompt the shared answer model with the memory list.
         model = resolve_answer_model()
-        prompt = (
-            "Answer the question using the memories below. If the answer "
-            "isn't in the memories, say so honestly — do not fabricate.\n\n"
-            f"--- Memories ---\n{context}\n\n"
-            f"--- Question ---\n{question}"
-        )
+        prompt = make_qa_prompt(context=context, question=question)
         result = self._llm.complete(
             model=model,
             system=None,

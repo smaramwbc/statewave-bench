@@ -21,8 +21,11 @@ smaller models for the pilot run.
 from __future__ import annotations
 
 import os
+import re
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TypeVar
 
 # Provider client imports stay top-level — these are library deps,
 # always installed. The actual API calls only fire when an answer or
@@ -34,7 +37,13 @@ from typing import Literal
 # Switch providers by changing the model string — the client
 # auto-routes by name prefix.
 
-DEFAULT_ANSWER_MODEL = "claude-sonnet-4-6"
+# Default answer model is claude-haiku-4-5: ~2x faster than Sonnet at
+# comparable LoCoMo accuracy on conv-26 probes. Matches the answer model
+# Honcho's published bench uses, so our numbers are directly comparable
+# to theirs without a model-mix confound. Override via SWB_ANSWER_MODEL
+# for the (slower, more expensive) Sonnet track if needed for production
+# comparison runs.
+DEFAULT_ANSWER_MODEL = "claude-haiku-4-5"
 DEFAULT_JUDGE_MODEL = "gpt-4o-2024-08-06"
 
 
@@ -54,6 +63,104 @@ class LlmCall:
 
 
 Provider = Literal["anthropic", "openai"]
+
+
+# ── Retry helper (shared by answer + judge calls) ─────────────────────────
+
+
+class ProviderQuotaExhausted(RuntimeError):
+    """The provider reports the operator's quota / credit balance is
+    exhausted. Every subsequent call will fail the same way; retries
+    won't help and continuing burns spend on requests that can never
+    succeed. The runner catches this at the top level and halts the
+    bench so the operator can refill and re-run with --resume.
+
+    Triggered by provider error messages containing:
+      - `insufficient_quota`           (OpenAI)
+      - `quota_exceeded`               (OpenAI variant)
+      - `credit balance is too low`    (Anthropic)
+      - `billing_quota_exceeded`       (other)
+    """
+
+
+# Provider error-body markers that indicate "no more credits / quota".
+# Matched case-insensitively against str(exc).
+_QUOTA_MARKERS: tuple[str, ...] = (
+    "insufficient_quota",
+    "quota_exceeded",
+    "billing_quota_exceeded",
+    "credit balance is too low",
+)
+
+
+# Patterns that indicate the failure is transient and worth retrying.
+# Anthropic 529 ("overloaded_error") is the dominant pattern we saw
+# during the first --limit 10 run — bursts that lasted minutes and
+# burned through the runner's failure-streak breaker on every system.
+# Catching it here means individual answer / judge calls retry through
+# the burst instead of bubbling up as fatal failures.
+_TRANSIENT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bError code:\s*5\d\d\b", re.IGNORECASE),
+    re.compile(r"\bError code:\s*429\b", re.IGNORECASE),
+    re.compile(r"\bConnectionError\b", re.IGNORECASE),
+    re.compile(r"\bRemoteProtocolError\b", re.IGNORECASE),
+    re.compile(r"\bAPITimeoutError\b", re.IGNORECASE),
+    re.compile(r"\bAPIConnectionError\b", re.IGNORECASE),
+    re.compile(r"\boverloaded_error\b", re.IGNORECASE),  # Anthropic 529 body
+    re.compile(r"\btimed?\s*out\b", re.IGNORECASE),
+)
+
+
+def _is_quota_error(err: BaseException) -> bool:
+    s = str(err).lower()
+    return any(marker.lower() in s for marker in _QUOTA_MARKERS)
+
+
+def _is_transient(err: BaseException) -> bool:
+    s = str(err)
+    return any(p.search(s) for p in _TRANSIENT_PATTERNS)
+
+
+T = TypeVar("T")
+
+
+def call_with_retry(
+    fn: Callable[[], T],
+    *,
+    max_attempts: int = 5,
+    initial_backoff_sec: float = 1.0,
+    backoff_multiplier: float = 4.0,
+    backoff_cap_sec: float = 60.0,
+) -> T:
+    """Call `fn`, retrying on transient errors with capped exponential backoff.
+
+    - Quota errors short-circuit immediately as ProviderQuotaExhausted.
+    - Transient errors (5xx incl. Anthropic 529, 429-without-quota,
+      connection/timeout, overloaded_error body) get up to
+      `max_attempts` tries. Default backoff schedule with the defaults
+      above: 1s -> 4s -> 16s -> 60s -> 60s. Total patience ~2.5 min.
+    - Non-transient errors (4xx, parse failures, etc.) re-raise on the
+      first occurrence — no point retrying a 400 bad request.
+
+    Used by both `LlmClient.complete()` (so every answer + judge call
+    gets the same safety net) and by the rescore command. Tunable
+    backoff_cap_sec keeps the final retries from sleeping multiple
+    minutes when the provider is genuinely down.
+    """
+    backoff = initial_backoff_sec
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if _is_quota_error(e):
+                raise ProviderQuotaExhausted(str(e)) from e
+            if attempt < max_attempts and _is_transient(e):
+                time.sleep(backoff)
+                backoff = min(backoff * backoff_multiplier, backoff_cap_sec)
+                continue
+            raise
+    # Unreachable — the loop always either returns or raises.
+    raise RuntimeError("retry loop exhausted without returning or raising")
 
 
 # ── Client implementation ─────────────────────────────────────────────────
@@ -79,10 +186,22 @@ class LlmClient:
         max_tokens: int = 1024,
         temperature: float = 0.0,
     ) -> LlmCall:
+        """One call to the answer or judge model. Wrapped in
+        `call_with_retry` so transient provider errors (Anthropic 529
+        overloaded bursts, OpenAI 5xx, timeouts) don't bubble up as
+        fatal failures — they retry up to 5 times with capped
+        exponential backoff. Quota errors short-circuit as
+        `ProviderQuotaExhausted` so the bench halts cleanly instead
+        of burning more spend.
+        """
         provider = _provider_for(model)
-        if provider == "anthropic":
-            return self._anthropic_complete(model, system, user, max_tokens, temperature)
-        return self._openai_complete(model, system, user, max_tokens, temperature)
+
+        def _call() -> LlmCall:
+            if provider == "anthropic":
+                return self._anthropic_complete(model, system, user, max_tokens, temperature)
+            return self._openai_complete(model, system, user, max_tokens, temperature)
+
+        return call_with_retry(_call)
 
     # ── Anthropic ─────────────────────────────────────────────────────────
 
@@ -199,6 +318,31 @@ def resolve_answer_model() -> str:
 
 def resolve_judge_model() -> str:
     return os.environ.get("SWB_JUDGE_MODEL", DEFAULT_JUDGE_MODEL)
+
+
+# ── Unified answer prompt ─────────────────────────────────────────────────
+#
+# Every system-under-test eventually pastes its retrieved context into an
+# answer prompt. Keeping the wording identical across adapters is a
+# fairness control — otherwise prompt-engineering noise leaks into the
+# cross-system comparison. In particular, the naive baseline previously
+# omitted the "do not fabricate" instruction, which would have inflated
+# its adversarial-refusal rate relative to the other systems.
+
+
+def make_qa_prompt(*, context: str, question: str) -> str:
+    """Single QA prompt used by every memory-using adapter.
+
+    Same wording, same "do not fabricate" instruction, same section
+    headers — so any difference in answer quality reflects the memory
+    layer, not the prompt the adapter happened to write.
+    """
+    return (
+        "Answer the question using the context below. If the answer "
+        "isn't in the context, say so honestly — do not fabricate.\n\n"
+        f"--- Context ---\n{context}\n\n"
+        f"--- Question ---\n{question}"
+    )
 
 
 # ── Live provider health checks ───────────────────────────────────────────

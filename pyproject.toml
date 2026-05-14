@@ -56,6 +56,12 @@ dependencies = [
   # Result reporting + charts
   "polars>=1.0",            # results dataframe; faster + simpler API than pandas
   "altair>=5.4",            # Vega-Lite charts; HTML output ready for embedding
+
+  # LoCoMo timestamps are free-form ("1:56 pm on 8 May, 2023") — the
+  # Zep adapter parses them via dateutil's fuzzy parser to produce
+  # RFC 3339 strings for Zep's `Message.created_at`. Stdlib
+  # `datetime.fromisoformat` is too strict for the source shape.
+  "python-dateutil>=2.9",
 ]
 
 [project.optional-dependencies]
@@ -66,6 +72,7 @@ dev = [
   "ruff>=0.6",
   "mypy>=1.10",
   "types-requests",
+  "types-python-dateutil",
 ]
 
 [project.scripts]

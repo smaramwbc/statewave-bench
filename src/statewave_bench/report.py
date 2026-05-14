@@ -77,7 +77,22 @@ def render_report(
 def _aggregate_overall(df: pl.DataFrame) -> pl.DataFrame:
     """One row per system with mean score + total tokens + median latency.
     `score.mean()` skips null scores (judge_failed rows), so transient
-    judge failures don't drag the mean down — only the count drops."""
+    judge failures don't drag the mean down — only the count drops.
+
+    Two means side-by-side:
+      - `mean_score` over every question (our default canonical number)
+      - `mean_score_excl_adversarial` over open-domain / multi_hop /
+        single_hop / temporal only — the SOTA-comparable subset that
+        Mem0 / Honcho / Backboard / Memori publish numbers against.
+    """
+    # Per-system "exclude adversarial" mean. Done as a side aggregation
+    # so the full-mean version stays a single pl expression; joined back
+    # below.
+    excl_mean = (
+        df.filter(pl.col("category") != "adversarial")
+        .group_by("system")
+        .agg(pl.col("score").mean().alias("mean_score_excl_adversarial"))
+    )
     return (
         df.group_by("system")
         .agg(
@@ -91,6 +106,7 @@ def _aggregate_overall(df: pl.DataFrame) -> pl.DataFrame:
             pl.col("elapsed_ms").median().alias("median_elapsed_ms"),
             pl.col("elapsed_ms").quantile(0.95).alias("p95_elapsed_ms"),
         )
+        .join(excl_mean, on="system", how="left")
         .sort("mean_score", descending=True, nulls_last=True)
     )
 
@@ -133,15 +149,17 @@ def _write_markdown_summary(
 
     lines += ["## Overall", ""]
     lines.append(
-        "| System | Mean score | n | Avg input tok / q | Avg output tok / q | "
-        "Median latency (s) | p95 latency (s) |"
+        "| System | Mean score | Mean (excl. adv) | n | Avg input tok / q | "
+        "Avg output tok / q | Median latency (s) | p95 latency (s) |"
     )
-    lines.append("|---|---:|---:|---:|---:|---:|---:|")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
     for row in overall.iter_rows(named=True):
         n = row["n_scored"] or 1
         mean = row["mean_score"] if row["mean_score"] is not None else 0.0
+        mean_excl = row.get("mean_score_excl_adversarial")
+        mean_excl_str = f"{mean_excl:.3f}" if isinstance(mean_excl, float) else "—"
         lines.append(
-            f"| {row['system']} | {mean:.3f} | {n} | "
+            f"| {row['system']} | {mean:.3f} | {mean_excl_str} | {n} | "
             f"{row['total_input_tokens'] / n:.0f} | {row['total_output_tokens'] / n:.0f} | "
             f"{row['median_elapsed_ms'] / 1000:.2f} | {row['p95_elapsed_ms'] / 1000:.2f} |"
         )

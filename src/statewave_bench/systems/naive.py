@@ -23,7 +23,7 @@ import time
 from collections import defaultdict, deque
 
 from ..dataset import LocomoConversation, LocomoTurn
-from ..llm import LlmClient, resolve_answer_model
+from ..llm import LlmClient, make_qa_prompt, resolve_answer_model
 from .base import AnswerResult, HealthResult, MemorySystem
 
 # Tunable: how many turns to keep. 100 is a deliberately permissive
@@ -61,12 +61,7 @@ class NaiveSystem(MemorySystem):
             for t in window
         )
         model = resolve_answer_model()
-        prompt = (
-            "Use the conversation history below to answer the question. "
-            "If the answer isn't in the history, say so honestly.\n\n"
-            f"--- Conversation history ---\n{context}\n\n"
-            f"--- Question ---\n{question}"
-        )
+        prompt = make_qa_prompt(context=context, question=question)
         start = time.perf_counter()
         result = self._llm.complete(
             model=model,

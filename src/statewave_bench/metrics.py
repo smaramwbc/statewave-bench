@@ -34,100 +34,19 @@ shouldn't get to hide that under one global number.
 
 from __future__ import annotations
 
+import os
 import re
 import string
-import time
 from collections import Counter
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TypeVar
 
-from .llm import LlmCall, LlmClient
+from .llm import LlmClient, ProviderQuotaExhausted
 
-
-class JudgeQuotaExhausted(RuntimeError):
-    """The judge provider reports the operator's quota / credit balance
-    is exhausted. Retries won't help — every subsequent judge call would
-    fail the same way, and burning more answer-model spend on questions
-    that can't be scored is wasteful. The runner catches this at the
-    top level and halts the bench cleanly so the operator can refill
-    and re-run with --resume.
-
-    Triggered by provider error messages containing:
-      - `insufficient_quota`    (OpenAI)
-      - `quota_exceeded`        (OpenAI variant)
-      - `credit balance is too low`  (Anthropic)
-      - `billing_quota_exceeded`     (other)
-    """
-
-
-# Provider error-body markers that indicate "no more credits / quota".
-# Matched case-insensitively against str(exc).
-_QUOTA_MARKERS: tuple[str, ...] = (
-    "insufficient_quota",
-    "quota_exceeded",
-    "billing_quota_exceeded",
-    "credit balance is too low",
-)
-
-
-# Patterns that indicate the failure is transient and worth retrying.
-# Provider 5xx (server overload), 429 without quota markers (rate limit),
-# connection-level failures, timeouts. Matched against str(exc).
-_TRANSIENT_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\bError code:\s*5\d\d\b", re.IGNORECASE),
-    re.compile(r"\bError code:\s*429\b", re.IGNORECASE),
-    re.compile(r"\bConnectionError\b", re.IGNORECASE),
-    re.compile(r"\bRemoteProtocolError\b", re.IGNORECASE),
-    re.compile(r"\bAPITimeoutError\b", re.IGNORECASE),
-    re.compile(r"\bAPIConnectionError\b", re.IGNORECASE),
-    re.compile(r"\btimed?\s*out\b", re.IGNORECASE),
-)
-
-
-def _is_quota_error(err: BaseException) -> bool:
-    s = str(err).lower()
-    return any(marker.lower() in s for marker in _QUOTA_MARKERS)
-
-
-def _is_transient(err: BaseException) -> bool:
-    s = str(err)
-    return any(p.search(s) for p in _TRANSIENT_PATTERNS)
-
-
-T = TypeVar("T")
-
-
-def _call_judge_with_retry(
-    fn: Callable[[], T],
-    *,
-    max_attempts: int = 3,
-    initial_backoff_sec: float = 1.0,
-    backoff_multiplier: float = 4.0,
-) -> T:
-    """Call `fn`, retrying on transient errors with exponential backoff.
-
-    - Quota errors short-circuit immediately as JudgeQuotaExhausted.
-    - Transient errors (5xx, 429-without-quota, connection/timeout) get
-      up to `max_attempts` tries with backoff 1s -> 4s -> 16s.
-    - Non-transient errors (4xx, parse failures, etc.) re-raise on the
-      first occurrence.
-    """
-    backoff = initial_backoff_sec
-    for attempt in range(1, max_attempts + 1):
-        try:
-            return fn()
-        except Exception as e:
-            if _is_quota_error(e):
-                raise JudgeQuotaExhausted(str(e)) from e
-            if attempt < max_attempts and _is_transient(e):
-                time.sleep(backoff)
-                backoff *= backoff_multiplier
-                continue
-            raise
-    # Unreachable — the loop always either returns or raises — but mypy
-    # can't see it, so close the function explicitly.
-    raise RuntimeError("retry loop exhausted without returning or raising")
+# Backward-compat alias — runner imports this name; under the hood it's
+# the provider-level exception from llm.py (raised by both answer and
+# judge calls via call_with_retry). Kept so the runner's halt-on-quota
+# handler stays unchanged when the answer-call retry was added.
+JudgeQuotaExhausted = ProviderQuotaExhausted
 
 
 # Categories where the right metric is semantic equivalence (LLM-judge),
@@ -219,6 +138,76 @@ _JUDGE_USER_TEMPLATE = (
     "Question: {question}\nGround truth: {truth}\nPrediction: {prediction}\n\nVerdict:"
 )
 
+# Permissive judge — byte-stable port of the upstream Mem0 LoCoMo judge
+# template (the LongMem-style prompt that Mem0 / Honcho / Backboard /
+# Memori all use to produce their published SOTA numbers). Use this mode
+# (set SWB_SCORING_MODE=permissive) when reporting numbers meant to be
+# compared against published SOTA.
+#
+# Key behaviors of this prompt that drive its leniency vs our strict
+# default:
+#   - explicit "be generous with your grading" instruction (repeated 4x)
+#   - "touches on the same topic as the gold answer" suffices for CORRECT
+#   - format differences explicitly forgiven (e.g. "May 7th" = "7 May")
+#   - relative time references accepted ("last Tuesday")
+# These match what locomo-audit measured: standard LongMem-style judge
+# accepts up to 63% of *intentionally wrong* answers.
+#
+# Mem0 runs this prompt 10x with majority vote per question — we don't
+# (single-call is enough to measure the prompt-vs-prompt methodology
+# spread, and 10x would multiply judge cost by 10x for marginal noise
+# reduction). The published-vs-us comparison is "Mem0-prompt single
+# call" vs "our-prompt single call" — apples-to-apples on the prompt
+# axis, with majority-vote noise reduction as a known unknown.
+#
+# Source: github.com/rtuosto/agent-memory-benchmark
+# (byte-stable port of Mem0's upstream template — fingerprinted &
+# tested against drift).
+_PERMISSIVE_JUDGE_SYSTEM = ""  # Mem0's template puts everything in user msg
+
+_PERMISSIVE_JUDGE_USER_TEMPLATE = (
+    'Your task is to label an answer to a question as "CORRECT" or "WRONG". You will be given\n'
+    "the following data: (1) a question (posed by one user to another user), (2) a 'gold'\n"
+    "(ground truth) answer, (3) a generated answer which you will score as CORRECT/WRONG.\n"
+    "\n"
+    "The point of the question is to ask about something one user should know about the other\n"
+    "user based on their prior conversations. The gold answer will usually be a concise and\n"
+    "short answer that includes the referenced topic, for example:\n"
+    "\n"
+    "Question: Do you remember what I got the last time I went to Hawaii?\n"
+    "Gold answer: A shell necklace\n"
+    "\n"
+    "The generated answer might be much longer, but you should be generous with your "
+    "grading -\n"
+    "as long as it touches on the same topic as the gold answer, it should be counted as "
+    "CORRECT.\n"
+    "\n"
+    "For time related questions, the gold answer will be a specific date, month, year, etc. "
+    "The\n"
+    "generated answer might be much longer or use relative time references (like 'last "
+    "Tuesday'\n"
+    "or 'next month'), but you should be generous with your grading - as long as it refers "
+    "to the\n"
+    "same date or time period as the gold answer, it should be counted as CORRECT. Even if "
+    "the\n"
+    "format differs (e.g., 'May 7th' vs '7 May'), consider it CORRECT if it's the same "
+    "date.\n"
+    "\n"
+    "Now it's time for the real question:\n"
+    "\n"
+    "Question: {question}\n"
+    "Gold answer: {truth}\n"
+    "Generated answer: {prediction}\n"
+    "\n"
+    "First, provide a short (one sentence) explanation of your reasoning, then finish "
+    "with\n"
+    "CORRECT or WRONG. Do NOT include both CORRECT and WRONG in your response, or it "
+    "will\n"
+    "break the evaluation script.\n"
+    "\n"
+    'Just return the label CORRECT or WRONG in a json format with the key as "label".'
+)
+
 
 def llm_judge(
     *,
@@ -227,29 +216,54 @@ def llm_judge(
     ground_truth: str,
     llm: LlmClient,
     model: str,
+    permissive: bool = False,
 ) -> float:
     """Score an open-ended answer via a separate LLM. Returns 1.0 if
     the judge says CORRECT, 0.0 otherwise. The judge model is
     deliberately different from the answer model (config'd in
     llm.py) to reduce same-model-bias.
 
-    Wrapped in `_call_judge_with_retry` — transient OpenAI 5xx /
-    Anthropic 529 / connection failures are retried with backoff;
-    quota exhaustion short-circuits as JudgeQuotaExhausted.
+    When `permissive=True`, swap to the verbatim Mem0/LongMem judge
+    template (see `_PERMISSIVE_JUDGE_USER_TEMPLATE` docstring). The
+    Mem0 template emits CORRECT/WRONG (not CORRECT/INCORRECT) and
+    is instructed to provide a one-sentence explanation followed by
+    a JSON `{"label": "CORRECT"}` — we parse permissively for either
+    a JSON label or a bare CORRECT/WRONG token in the response.
     """
-
-    def _call() -> LlmCall:
-        return llm.complete(
+    if permissive:
+        result = llm.complete(
             model=model,
-            system=_JUDGE_SYSTEM,
-            user=_JUDGE_USER_TEMPLATE.format(
+            system=None,
+            user=_PERMISSIVE_JUDGE_USER_TEMPLATE.format(
                 question=question, truth=ground_truth, prediction=prediction
             ),
-            max_tokens=8,
+            # 200 tokens covers the "one sentence + verdict + json" the
+            # Mem0 template asks for. 8 (our strict-mode budget) would
+            # truncate before the verdict lands.
+            max_tokens=200,
             temperature=0.0,
         )
+        verdict_text = result.answer.strip().upper()
+        # The template instructs the judge to emit JSON `{"label":
+        # "CORRECT"}` — but in practice judges sometimes drop the JSON
+        # wrapper and just write "CORRECT" / "WRONG". Accept either.
+        # "WRONG" in raw text wins if both tokens appear (defensive —
+        # the prompt explicitly says don't include both).
+        if "WRONG" in verdict_text:
+            return 0.0
+        if "CORRECT" in verdict_text:
+            return 1.0
+        return 0.0
 
-    result = _call_judge_with_retry(_call)
+    result = llm.complete(
+        model=model,
+        system=_JUDGE_SYSTEM,
+        user=_JUDGE_USER_TEMPLATE.format(
+            question=question, truth=ground_truth, prediction=prediction
+        ),
+        max_tokens=8,
+        temperature=0.0,
+    )
     verdict = result.answer.strip().upper()
     # Be permissive on the parse — if the judge tacks on punctuation
     # or wraps the verdict, look for the keyword anywhere.
@@ -291,19 +305,15 @@ def llm_judge_refusal(
     refuses to answer (correct behavior — the fact isn't in the
     conversation), 0.0 if it fabricates a specific answer.
 
-    Same retry semantics as `llm_judge`.
+    Retry semantics inherited from `LlmClient.complete`.
     """
-
-    def _call() -> LlmCall:
-        return llm.complete(
-            model=model,
-            system=_REFUSAL_JUDGE_SYSTEM,
-            user=_REFUSAL_JUDGE_USER_TEMPLATE.format(question=question, prediction=prediction),
-            max_tokens=8,
-            temperature=0.0,
-        )
-
-    result = _call_judge_with_retry(_call)
+    result = llm.complete(
+        model=model,
+        system=_REFUSAL_JUDGE_SYSTEM,
+        user=_REFUSAL_JUDGE_USER_TEMPLATE.format(question=question, prediction=prediction),
+        max_tokens=8,
+        temperature=0.0,
+    )
     verdict = result.answer.strip().upper()
     if "REFUSAL" in verdict and "FABRICATION" not in verdict:
         return 1.0
@@ -324,8 +334,30 @@ def score_answer(
 ) -> Score:
     """Score one answer, picking the right metric for the question
     category. Caller passes a shared `llm` so judge calls reuse the
-    same client + cache."""
+    same client + cache.
+
+    Two scoring modes (selected via SWB_SCORING_MODE):
+      - `strict` (default): F1 for single_hop, strict LLM-judge for
+        multi_hop/temporal/open_*, refusal-judge for adversarial. Our
+        canonical methodology — defensible and slightly under-reports
+        relative to lenient SOTA harnesses.
+      - `permissive`: LLM-judges EVERY category (including single_hop
+        and adversarial against an empty truth) with a generous prompt
+        that accepts paraphrase, partial-overlap, hedged answers, and
+        format variation. This matches the LongMem / public-SOTA
+        scoring pattern. Use for apples-to-apples comparison against
+        Mem0 91.6% / Honcho 89.9% / Backboard 90.1% / Memori 82%.
+    """
+    mode = os.environ.get("SWB_SCORING_MODE", "strict").lower()
+    permissive = mode == "permissive"
+
     if category in REFUSAL_CATEGORIES:
+        # Adversarial questions are intentionally unanswerable — ground
+        # truth is empty, and the correct behavior is to refuse. The
+        # refusal judge is the right metric regardless of strict /
+        # permissive mode. (Public-SOTA harnesses drop adversarial
+        # entirely; the report layer surfaces an adversarial-excluded
+        # mean for apples-to-apples comparison.)
         value = llm_judge_refusal(
             question=question,
             prediction=prediction,
@@ -333,13 +365,14 @@ def score_answer(
             model=judge_model,
         )
         return Score(value=value, metric="refusal_judge")
-    if category in LLM_JUDGE_CATEGORIES:
+    if permissive or category in LLM_JUDGE_CATEGORIES:
         value = llm_judge(
             question=question,
             prediction=prediction,
             ground_truth=ground_truth,
             llm=llm,
             model=judge_model,
+            permissive=permissive,
         )
         return Score(value=value, metric="llm_judge")
     return Score(value=f1(prediction, ground_truth), metric="f1")

@@ -46,10 +46,14 @@ console = Console()
 # for that system. Saves the operator from burning the whole question
 # set when a provider's API is down / out-of-balance / mis-keyed.
 #
-# 3 is conservative — one transient blip won't trip it; three in a
-# row almost always means systemic. The runner logs the abort so it's
-# visible in the JSONL trailer.
-FAILURE_STREAK_THRESHOLD = 3
+# 8 is the post-incident calibration. The original 3 fired hundreds of
+# times during the first --limit 10 run because Anthropic had a 529
+# "Overloaded" cascade — each individual call retries up to 5x inside
+# LlmClient.complete now, so reaching 8 consecutive *post-retry*
+# failures genuinely means the provider is sustainably down, not just
+# a 2-minute capacity blip. Quota errors short-circuit separately via
+# JudgeQuotaExhausted so this threshold doesn't gate on those.
+FAILURE_STREAK_THRESHOLD = 8
 
 
 # ── Result records ────────────────────────────────────────────────────────

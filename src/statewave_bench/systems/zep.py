@@ -26,14 +26,43 @@ import contextlib
 import os
 import re
 import time
+from datetime import UTC
+
+from dateutil import parser as _dateparser
 
 from ..dataset import LocomoConversation
-from ..llm import LlmClient, resolve_answer_model
+from ..llm import LlmClient, make_qa_prompt, resolve_answer_model
 from .base import AnswerResult, HealthResult, MemorySystem
 
 # Zep restricts user_id charset (alphanumeric + dash); LoCoMo ids are
 # usually clean but normalize to be safe.
 _UNSAFE_USER_ID = re.compile(r"[^a-zA-Z0-9-]+")
+
+
+def _to_iso8601(timestamp: str | None) -> str | None:
+    """Convert LoCoMo's free-form timestamp ("1:56 pm on 8 May, 2023") to
+    RFC 3339 with timezone ("2023-05-08T13:56:00+00:00") for Zep's
+    `Message.created_at`.
+
+    LoCoMo's `.timestamp` is a human-readable string from the dataset
+    ("11:00 am on 25 Dec, 2022", "8 May, 2023", sometimes empty). Zep's
+    API rejects timestamps without a timezone with a 400 "invalid json"
+    (RFC 3339 requires the offset), and treats unparseable values as
+    missing — falling back to ingest time, which is exactly the bug
+    this layer exists to prevent. So: parse fuzzy, attach UTC if the
+    parse produced a naive datetime, then isoformat.
+    """
+    if not timestamp:
+        return None
+    try:
+        dt = _dateparser.parse(timestamp, fuzzy=True)
+    except (ValueError, OverflowError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    # dateutil's stubs declare datetime methods as returning Any in
+    # some paths; the runtime is always str. Cast to satisfy mypy.
+    return str(dt.isoformat())
 
 
 def _user_id_for(conversation_id: str) -> str:
@@ -72,11 +101,27 @@ ZEP_TERMINAL_STATUSES = frozenset({"completed", "success", "succeeded", "failed"
 # on a 19-session LoCoMo conversation.
 ZEP_GRAPH_SETTLE_POLL_SEC = 5.0
 ZEP_GRAPH_SETTLE_STABLE_COUNT = 3
-# 240s empirically — a 19-session LoCoMo conversation was still growing
-# at 120s in the first verification probe. Doubling the budget so the
-# bench measures Zep's actual graph (not a half-built one) without
-# making per-conversation wall time unreasonable.
-ZEP_GRAPH_SETTLE_TIMEOUT_SEC = 240.0
+# 900s — bumped again after the first --limit 10 run saw conv-41 and
+# conv-43 blow past the 480s budget with the graph still actively
+# growing (logged "zep graph still growing after 480s, refusing to
+# score against an unsettled graph"). 15 minutes is a lot of patience
+# but the settle detector exits early if the length stabilizes, so
+# this only costs real wall time on the conversations that genuinely
+# need it. Better to wait honestly than to lose 199 questions on an
+# ingest-failure exception that aborts the (system, conv) pair.
+ZEP_GRAPH_SETTLE_TIMEOUT_SEC = 900.0
+
+# graph.search retrieval budget — matches Statewave's 2048-token context
+# bundle at ~4 chars per token, so the answer model sees comparable
+# context sizes across systems. `limit` is a count cap; `max_characters`
+# is the actual prompt budget. `reranker='mmr'` with mmr_lambda=0.5
+# trades relevance for diversity 50/50 — important for multi_hop
+# questions that need 3-6 distinct facts (a pure relevance reranker
+# returns near-duplicates of the same fact at the top of the list).
+ZEP_SEARCH_LIMIT = 20
+ZEP_SEARCH_MAX_CHARS = 8192
+ZEP_SEARCH_RERANKER = "mmr"
+ZEP_SEARCH_MMR_LAMBDA = 0.5
 
 
 # Zep's add_messages_batch is the fast path for bulk ingest — one
@@ -128,11 +173,24 @@ class ZepSystem(MemorySystem):
             # timestamp in content, the graph never gets the absolute
             # date for relative phrases ("last Saturday", "two days
             # ago") and the bench's temporal questions are unanswerable.
+            #
+            # `created_at` is Zep's canonical temporal anchor — Graphiti
+            # uses it as each message's reference_time when extracting
+            # facts and setting their `valid_at`. WITHOUT it, every
+            # message defaults to ingest time (today), so every fact's
+            # `valid_at` lands in 2026 and Zep predicts events from a
+            # 2023 conversation happened "yesterday relative to today."
+            # Confirmed in the pre-fix run: Zep literally returned
+            # "Caroline attended the support group on May 11, 2026"
+            # for an event grounded in May 2023. The bench's `[date]`
+            # content prefix is informational text Graphiti may or may
+            # not parse; `created_at` is the explicit channel.
             messages = [
                 Message(
                     content=(f"[{turn.timestamp}] {turn.text}" if turn.timestamp else turn.text),
                     role=("assistant" if turn.speaker.lower() == "assistant" else "user"),
                     name=turn.speaker,
+                    created_at=_to_iso8601(turn.timestamp),
                     metadata={"session_id": session_idx, "bench": "locomo"},
                 )
                 for turn in session
@@ -143,24 +201,22 @@ class ZepSystem(MemorySystem):
             # serially is fine because add_messages is synchronous
             # (extraction is async on Zep's side, but the API call
             # itself returns when the messages are accepted).
+            #
+            # Per-chunk exceptions propagate to the runner, which drops
+            # the whole (system, conv) pair. Matches Statewave's
+            # contract: a partial graph that scores against missing
+            # facts is worse than recording nothing, because the
+            # leaderboard would mix "Zep lost the fact fairly" with
+            # "Zep never saw the fact."
             for chunk_start in range(0, len(messages), ZEP_MAX_MESSAGES_PER_REQUEST):
                 chunk = messages[chunk_start : chunk_start + ZEP_MAX_MESSAGES_PER_REQUEST]
-                try:
-                    response = self._client.thread.add_messages(
-                        thread_id,
-                        messages=chunk,
-                    )
-                    task_id = getattr(response, "task_id", None)
-                    if task_id:
-                        task_ids.append(task_id)
-                except Exception as e:
-                    from ..runner import console
-
-                    console.print(
-                        f"[yellow]zep ingest failed for session {session_idx} "
-                        f"(chunk {chunk_start // ZEP_MAX_MESSAGES_PER_REQUEST}) "
-                        f"of {conversation.id}:[/] {e}"
-                    )
+                response = self._client.thread.add_messages(
+                    thread_id,
+                    messages=chunk,
+                )
+                task_id = getattr(response, "task_id", None)
+                if task_id:
+                    task_ids.append(task_id)
 
         # Block until all graph-build tasks are terminal (completed or
         # failed). Mirrors the Statewave compile-wait contract: ingest
@@ -177,55 +233,64 @@ class ZepSystem(MemorySystem):
     def _wait_for_tasks(self, task_ids: list[str], *, conversation_id: str) -> None:
         if not task_ids:
             return
-        from ..runner import console
 
         pending = list(task_ids)
+        failed: list[tuple[str, str]] = []
         elapsed = 0.0
         while pending and elapsed < ZEP_TASK_TIMEOUT_SEC:
             still_pending: list[str] = []
             for tid in pending:
+                # Transient poll exceptions become "still pending" — a
+                # one-off network blip shouldn't fail the whole
+                # conversation. If polling is broken end-to-end the
+                # timeout below catches it and raises.
                 try:
                     task = self._client.task.get(tid)
-                except Exception as e:
-                    # Polling failure is non-fatal — we treat it as
-                    # "still pending" and try again next tick. If the
-                    # whole API is down, the timeout below catches it.
-                    console.print(f"[yellow]zep task poll failed for {tid}:[/] {e}")
+                except Exception:
                     still_pending.append(tid)
                     continue
                 status = (task.status or "").lower()
                 if status in ZEP_TERMINAL_STATUSES:
                     if status not in ("completed", "success", "succeeded"):
-                        console.print(
-                            f"[yellow]zep task {tid} ended {status!r} "
-                            f"(conv={conversation_id}); proceeding with partial graph."
-                        )
+                        failed.append((tid, status))
                     continue
                 still_pending.append(tid)
             pending = still_pending
             if pending:
                 time.sleep(ZEP_TASK_POLL_INTERVAL_SEC)
                 elapsed += ZEP_TASK_POLL_INTERVAL_SEC
+        if failed:
+            details = ", ".join(f"{tid}={status!r}" for tid, status in failed)
+            raise RuntimeError(
+                f"zep ingest: {len(failed)} task(s) ended in a non-success state "
+                f"for {conversation_id} ({details}). Refusing to score against a "
+                f"partial graph."
+            )
         if pending:
-            console.print(
-                f"[yellow]zep ingest: {len(pending)} task(s) still pending after "
-                f"{ZEP_TASK_TIMEOUT_SEC:.0f}s for {conversation_id}; "
-                f"proceeding with whatever's been built."
+            raise RuntimeError(
+                f"zep ingest: {len(pending)} task(s) still pending after "
+                f"{ZEP_TASK_TIMEOUT_SEC:.0f}s for {conversation_id}. Refusing to "
+                f"score against a partial graph."
             )
 
     def _wait_for_graph_settle(self, *, thread_id: str, conversation_id: str) -> None:
-        from ..runner import console
-
         last_length: int | None = None
         stable_count = 0
         elapsed = 0.0
         while elapsed < ZEP_GRAPH_SETTLE_TIMEOUT_SEC:
+            # `get_user_context` is the right "graph still growing?"
+            # probe — it returns the current assembled context whose
+            # length monotonically grows while extraction is running.
+            # Note: this is NOT what `answer()` uses for retrieval —
+            # that path uses `graph.search` so the bench queries the
+            # graph with the actual question. See `answer()`.
             try:
                 ctx = self._client.thread.get_user_context(thread_id)
                 body = ctx.context or ""
             except Exception as e:
-                console.print(f"[yellow]zep settle-poll failed for {thread_id}:[/] {e}")
-                return
+                raise RuntimeError(
+                    f"zep graph-settle poll failed for {conversation_id} (thread={thread_id}): {e}"
+                ) from e
             length = len(body)
             if last_length is not None and length == last_length:
                 stable_count += 1
@@ -236,37 +301,48 @@ class ZepSystem(MemorySystem):
             last_length = length
             time.sleep(ZEP_GRAPH_SETTLE_POLL_SEC)
             elapsed += ZEP_GRAPH_SETTLE_POLL_SEC
-        console.print(
-            f"[yellow]zep graph still growing after {ZEP_GRAPH_SETTLE_TIMEOUT_SEC:.0f}s "
-            f"for {conversation_id}; proceeding anyway."
+        raise RuntimeError(
+            f"zep graph still growing after {ZEP_GRAPH_SETTLE_TIMEOUT_SEC:.0f}s "
+            f"for {conversation_id}. Refusing to score against a graph that "
+            f"hasn't settled."
         )
 
     def answer(self, conversation_id: str, question: str) -> AnswerResult:
-        thread_id = _thread_id_for(conversation_id)
+        user_id = _user_id_for(conversation_id)
         start = time.perf_counter()
 
-        # Step 1: retrieve Zep's structured memory bundle. This is
-        # Zep's recommended retrieval entry point — it returns a
-        # ready-to-paste-into-prompt context string built from the
-        # graph's relevant facts + thread summary. We use it as-is so
-        # we're benchmarking Zep-as-deployed, not our prompt-engineering.
-        try:
-            memory = self._client.thread.get_user_context(thread_id)
-            context = memory.context or "(no relevant memories found)"
-        except Exception as e:
-            from ..runner import console
-
-            console.print(f"[yellow]zep get_user_context failed:[/] {e}")
-            context = "(retrieval failed)"
+        # Step 1: retrieve question-conditioned facts from Zep's graph.
+        #
+        # Earlier versions of this adapter called `thread.get_user_context`
+        # which returns a static, question-agnostic thread summary —
+        # the wrong API for QA over memories. Zep's docs recommend
+        # `graph.search` for retrieval-against-the-graph; that's what
+        # production Zep-powered agents do, and it's what cross-system
+        # fairness requires (Statewave + Mem0 both use question-
+        # conditioned retrieval). MMR reranker at lambda=0.5 trades
+        # relevance for diversity 50/50, which matters for multi_hop
+        # questions that need several distinct facts (a pure-relevance
+        # reranker returns near-duplicates of the same fact).
+        #
+        # Retrieval errors propagate to the runner, which marks the
+        # question as a failure. Matches Statewave's behavior: a
+        # broken retrieval shouldn't be silently scored as a wrong
+        # answer (which conflates "Zep doesn't know" with "Zep API is
+        # down").
+        results = self._client.graph.search(
+            query=question,
+            user_id=user_id,
+            scope="edges",
+            limit=ZEP_SEARCH_LIMIT,
+            max_characters=ZEP_SEARCH_MAX_CHARS,
+            reranker=ZEP_SEARCH_RERANKER,
+            mmr_lambda=ZEP_SEARCH_MMR_LAMBDA,
+        )
+        context = _format_edges_as_context(results)
 
         # Step 2: prompt the shared answer model with the bundle.
         model = resolve_answer_model()
-        prompt = (
-            "Answer the question using the context below. If the answer "
-            "isn't in the context, say so honestly — do not fabricate.\n\n"
-            f"--- Context ---\n{context}\n\n"
-            f"--- Question ---\n{question}"
-        )
+        prompt = make_qa_prompt(context=context, question=question)
         result = self._llm.complete(
             model=model,
             system=None,
@@ -303,6 +379,35 @@ class ZepSystem(MemorySystem):
             return HealthResult(ok=True, detail="ok")
         except Exception as e:
             return HealthResult(ok=False, detail=_short(e))
+
+
+def _format_edges_as_context(results: object) -> str:
+    """Format `graph.search` results into a prompt-ready context block.
+
+    Edges carry `.fact` (the textual fact) plus optional `.valid_at`
+    (when the fact became true) and `.invalid_at` (when it stopped
+    being true). The temporal subset of LoCoMo needs these dates —
+    Zep's `valid_at` is the canonical source — so we prepend them
+    where present, falling back to plain fact text otherwise.
+    """
+    edges = getattr(results, "edges", None) or []
+    lines: list[str] = []
+    for edge in edges:
+        fact = getattr(edge, "fact", None)
+        if not fact:
+            continue
+        valid_at = getattr(edge, "valid_at", None)
+        invalid_at = getattr(edge, "invalid_at", None)
+        # Date prefix: [valid_at → invalid_at] fact, or just [valid_at] fact,
+        # or no prefix if neither is set.
+        if valid_at and invalid_at:
+            prefix = f"[{valid_at} → {invalid_at}] "
+        elif valid_at:
+            prefix = f"[{valid_at}] "
+        else:
+            prefix = ""
+        lines.append(f"- {prefix}{fact}")
+    return "\n".join(lines) if lines else "(no relevant memories found)"
 
 
 def _short(err: object) -> str:
