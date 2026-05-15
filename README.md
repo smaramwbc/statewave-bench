@@ -3,34 +3,44 @@
 [![CI](https://github.com/smaramwbc/statewave-bench/workflows/CI/badge.svg)](https://github.com/smaramwbc/statewave-bench/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Open benchmark for AI memory runtimes.
+**An open, reproducible benchmark for long-term conversational memory in AI agents.**
 
-Statewave Bench measures **how well a memory layer helps an LLM answer questions across long, multi-session conversations** — the actual job memory products do for production agents. Run it against Statewave, Mem0, Zep, naive context-stuffing, and a no-memory baseline to see which architecture wins on your axes (quality, cost, latency, or all three).
+Statewave Bench measures how well a memory layer lets an LLM answer questions across long, multi-session conversations — episodic and semantic recall, temporal reasoning, multi-hop reasoning, retrieval quality, and grounded answer generation over conversation histories that span months of simulated time. It evaluates [Statewave](https://statewave.ai) (an open-source memory runtime for AI agents) on the public [LoCoMo](https://github.com/snap-research/LoCoMo) dataset, alongside Mem0, Zep, a naive context-stuffing baseline, and a no-memory floor. Every number is produced by code in this repo and reproducible from the documented configuration.
 
-> 📋 **Issues & feature requests** for the entire Statewave workspace are tracked centrally on [`smaramwbc/statewave`](https://github.com/smaramwbc/statewave/issues) — including bench-specific ones. Issues are disabled on this repo so all reports funnel to one place.
+> 📋 **Issues & feature requests** for the entire Statewave workspace are tracked centrally on [`smaramwbc/statewave`](https://github.com/smaramwbc/statewave/issues). Issues are disabled on this repo so all reports funnel to one place.
 
-## Why
+📊 **Latest results:** see [RESULTS.md](RESULTS.md).
 
-Memory products are hard to differentiate on landing pages. Every vendor claims "long-term memory for agents." The actual question — *does this layer let my agent answer "what was the customer's onboarding date" three months later?* — is rarely answered with numbers. This repo does that, on a public dataset, with the full methodology and code so anyone can reproduce.
+---
 
-## What it does
+## What is being benchmarked?
 
-- Loads [LoCoMo](https://github.com/snap-research/LoCoMo) — Snap Research's public benchmark of multi-session conversations + factual recall questions
-- Ingests each conversation into every system under test
-- Asks each question, scores the answer (token-level F1 for exact answers, LLM-as-judge for open-ended)
-- Reports overall + per-category quality, plus token cost and latency, plus charts
+LoCoMo conversations are long and multi-session: ~19 sessions over ~6 months of simulated time, ~600 turns, ~199 categorized recall questions per conversation. Answering them correctly exercises the full job a memory layer does for a production agent:
 
-## Systems benchmarked
+- **Long-term conversational memory** — recalling something stated many sessions ago, not just in the recent window.
+- **Episodic recall** — *what happened*, and *when* it happened, in a specific past session.
+- **Semantic recall** — durable facts about the subject (preferences, relationships, attributes) abstracted from individual turns.
+- **Temporal reasoning** — resolving "last Saturday", "two days ago", "next month" against absolute dates, and answering "when did X happen?".
+- **Multi-hop reasoning** — combining facts from different turns or different sessions to reach an answer no single turn contains.
+- **Retrieval quality** — surfacing the *relevant* memories for a question out of an entire conversation history, under a token budget.
+- **Grounded answer generation** — producing an answer supported by retrieved memory, and correctly declining when the answer is genuinely absent.
+- **Stability across repeated runs** — LLM answer generation and LLM-as-judge scoring are both stochastic; a credible benchmark reports how much the score moves across independent passes, not just one number.
 
-| System | Approach | Notes |
-|---|---|---|
-| **statewave** | Compiled memories with provenance, ranked retrieval, deterministic context bundles | Self-hosted on Postgres |
-| **mem0** | Flat fact store with LLM-extracted memories | Cloud + self-hosted modes |
-| **zep** | Temporal knowledge graph (Graphiti) with bi-temporal validity | Cloud-first |
-| **naive** | Last-N conversation turns dumped into the prompt | The "every developer's first attempt" baseline |
-| **no_memory** | Same answer model, zero history | The floor — what does the LLM get right with nothing? |
+---
 
-The gap between **no_memory** and **naive** measures *"what naive context dumping adds over zero memory."* The gap between **naive** and any real memory system measures *"what the memory layer adds over naive context dumping"* — which is the actually-interesting question for adopters deciding whether to take on the complexity of a memory runtime.
+## Why 1 / 5 / 10 runs?
+
+A **run** is one full pass over the LoCoMo dataset: ingest → compile/index → retrieve → answer → score, for every system under test. Because both the answer model and the judge are stochastic, a single pass is one sample from a distribution. Repeating the pass and aggregating is what turns a directional signal into a defensible number.
+
+| Runs | Purpose | Recommended use | Confidence | Publish? |
+|---|---|---|---|---|
+| **1** | Smoke test | Validate setup and the full pipeline; first directional signal | Low | Internal only — label clearly as directional |
+| **5** | Stability check | Early public reporting and variance inspection | Medium | Acceptable if the run count and variance are stated |
+| **10** | Public benchmark | Main reported result; system-vs-system and version-vs-version comparison | Higher | Preferred public reporting format |
+
+More runs reduce the chance of over-interpreting one lucky or unlucky answer-model / judge sample. A difference between two systems is only meaningful if it exceeds the run-to-run variance at the run count you used. The 10-run aggregate is the preferred format for any public comparison.
+
+---
 
 ## Quickstart
 
@@ -47,130 +57,141 @@ $EDITOR .env
 # 3. Verify each system is reachable (no billable LLM calls).
 uv run swb config-check
 
-# 4. Smoke run — one conversation across all 5 systems, ~$10–$15.
+# 4. Smoke test — 1 conversation across all systems, first signal.
 uv run swb run --limit 1
-
-# Or full set when you're ready: 10 conversations, ~$100–$150 total.
-# uv run swb run
 
 # 5. Render the summary + charts.
 uv run swb report
 
-# Open results/results-overall.html in a browser.
+# Open results/results.html in a browser.
 ```
 
-## ⚠️ Cost note
+---
 
-**Running this benchmark costs real money on your OpenAI / Anthropic / system-vendor accounts.** You're paying for:
+## How to run
 
-- Every system's `ingest` calls (Mem0's fact extraction, Statewave's optional LLM compile, Zep's graph build)
-- Every question's `answer` call (the shared LLM the bench fixes for fair comparison)
-- One judge call per non-`single_hop` question (a separate model scores reasoning answers as CORRECT/INCORRECT; an adversarial-specific judge marks refusals as REFUSAL/FABRICATION)
+The CLI is `swb`. Every command is real and listed by `uv run swb --help`.
 
-LoCoMo's full dataset is **10 conversations × ~199 questions = ~1,986 questions per system**. The bench runs every question through every system, so 5 systems × 1,986 questions = ~9,930 question-runs total. Per question we make:
+| Command | What it does |
+|---|---|
+| `swb config-check` | Live, cost-trivial probe that each configured system + provider is reachable. |
+| `swb run` | One benchmark pass. Streams results to a JSONL file (fresh-by-default). |
+| `swb report` | Renders one JSONL into `results-summary.md` + `results.html`. |
+| `swb rescore` | Recomputes the `score` column of an existing JSONL with the current metric module (no re-ingest, no re-answer). |
 
-- 1 retrieval call (free for the bench's accounting — Mem0 / Zep handle internally; Statewave runs locally)
-- 1 answer call (~3K input + ~256 output tokens on Sonnet ≈ $0.013)
-- 1 judge call for every question except `single_hop` (~83% of LoCoMo: `multi_hop`, `temporal`, `open_domain`, `adversarial` are all LLM-scored; ~500 input + 8 output on GPT-4o ≈ $0.001)
+`swb run` options: `-s/--systems` (repeatable; default = all), `--limit N` (cap conversations; omit for the full set), `-o/--output PATH`, `--resume` (skip already-completed tuples instead of starting fresh), `--cache-dir`.
 
-Approximate costs on Claude Sonnet 4.6 + GPT-4o judge, January 2026 prices:
+### 1 run (smoke test)
 
-| Run scope | Question-runs | Judge calls | Estimated cost |
-|---|---:|---:|---:|
-| Smoke (1 conversation, all 5 systems) | ~995 | ~825 | $13–$18 |
-| Pilot (3 conversations) | ~2,985 | ~2,475 | $40–$55 |
-| Full set (10 conversations) | ~9,930 | ~8,240 | $130–$180 |
+```bash
+# Full dataset, one pass, all systems:
+uv run swb run -o results/run-1.json
+uv run swb report -i results/run-1.json
 
-Plus internal LLM costs the bench doesn't directly observe:
-
-- **Mem0** runs its own fact-extraction LLM call on every `add()` against the operator's OpenAI / Anthropic key — about $4–$8 across the full set
-- **Statewave with the LLM compiler** runs one compile per conversation (~$0.05 each, ~$0.50 total). Statewave with the heuristic compiler is $0
-- **Zep** bills graph-build LLM calls against the Zep plan, not against an external provider key — see Zep's pricing page
-
-Mem0 cloud + Zep cloud free tiers cover the smoke + pilot runs. Statewave's cost is just your own infrastructure (Postgres + the Statewave server, both self-hosted).
-
-**Always run the smoke first** — `swb run --limit 1` — so you confirm the harness works on your environment before committing to the full spend.
-
-## Methodology
-
-### Dataset
-
-[LoCoMo](https://github.com/snap-research/LoCoMo) — 10 multi-session conversations from Snap Research's 2024 paper *"Evaluating Very Long-Term Conversational Memory of LLM Agents."* Each conversation has ~19 sessions over ~6 months simulated time, totaling ~600 turns and ~199 categorized recall questions. The bench fetches the canonical `data/locomo10.json` directly from the upstream GitHub repo (cached locally on first use).
-
-Categories per the paper's Table 1:
-
-- `single_hop` (code 1) — answer lives in one utterance; short factoid
-- `multi_hop` (code 2) — answer requires combining facts from multiple utterances or sessions
-- `temporal` (code 3) — answer requires reasoning about *when* things happened
-- `open_domain` (code 4) — answer is open-ended
-- `adversarial` (code 5) — answer isn't in the conversation at all; the model should refuse
-
-We report scores per-category alongside the overall mean — a system that crushes single-session questions but bombs multi-session ones shouldn't get to hide that under one global number.
-
-### Scoring
-
-LoCoMo questions split into three scoring regimes (aligned with the paper's reference evaluator):
-
-- **`single_hop` — token-level F1.** SQuAD-style normalization (lowercase, drop punctuation, drop articles, collapse whitespace). The ground truth is unambiguous and any correct answer overlaps the truth tokens, so token overlap is the right metric.
-- **`multi_hop` / `temporal` / `open_domain` — LLM-as-judge.** The ground truth is a natural-language explanation; token-level F1 systematically penalizes verbose-but-correct paraphrases. A separate judge model (default: GPT-4o, deliberately different from the answer model to reduce same-model-bias) decides whether the prediction is semantically equivalent to the ground truth and returns CORRECT (1.0) or INCORRECT (0.0).
-- **`adversarial` — refusal judge.** The correct behavior is refusal; the ground truth is an empty string, and F1 against empty truth always returns 0 for any non-empty refusal text. A dedicated judge prompt returns REFUSAL (1.0) when the model declines to commit to a factual answer, or FABRICATION (0.0) when it answers a question that has no answer in the conversation.
-
-### Fairness controls
-
-- **Same answer model across systems.** Whichever model the operator chooses (default: Claude Sonnet 4.6 at temp=0), every system uses it for the final answer. A system can't win because it picked a stronger model.
-- **Same judge model across systems.** Same logic.
-- **Internal LLM costs reported separately.** Systems that issue their own LLM calls during ingest (Mem0's fact extractor, Statewave's optional LLM compiler) report those tokens under `internal_input_tokens` / `internal_output_tokens` so the operator sees the full bill, not just the answer-model cost.
-- **Per-conversation isolation.** Every system scopes its memory by conversation id (`bench:locomo:<id>` for Statewave/Mem0, `bench-locomo-<id>` for Zep). No cross-conversation leakage.
-- **Deterministic where possible.** Temperature 0, fixed seeds where SDKs expose them. LLM calls aren't perfectly deterministic but two runs should land within sampling noise.
-
-### Resumability
-
-Results stream to `results/run.jsonl` as the bench progresses. `swb run` is **fresh-by-default**: an existing file at the output path is deleted at startup so every run exercises the full `delete → ingest → compile → retrieve → answer` chain (otherwise the resume optimization would skip ingest for already-scored conversations, and you'd never test fixes to those layers).
-
-Pass `--resume` to opt back in to the legacy behavior: keep the existing file and skip already-completed `(system, conversation, question)` tuples. Useful for the multi-hour full-set run that might hit a transient error (Anthropic 529, Mem0 rate-limit, kernel panic) — re-run with `--resume` to pick up from the last gap.
-
-## Layout
-
-```
-statewave-bench/
-├── src/statewave_bench/
-│   ├── cli.py              # `swb` entry point: config-check / run / rescore / report
-│   ├── dataset.py          # LoCoMo loader (HuggingFace cache)
-│   ├── llm.py              # unified Anthropic + OpenAI client
-│   ├── metrics.py          # F1 + LLM-as-judge
-│   ├── runner.py           # main eval loop, JSONL streaming, resumability
-│   ├── report.py           # markdown summary + Vega-Lite charts
-│   └── systems/
-│       ├── base.py         # MemorySystem protocol
-│       ├── statewave.py    # uses statewave-py SDK
-│       ├── mem0.py         # uses mem0ai SDK
-│       ├── zep.py          # uses zep-cloud SDK
-│       ├── naive.py        # last-N-turn baseline
-│       └── no_memory.py    # zero-context floor
-├── data/                   # LoCoMo cache (gitignored)
-├── results/                # JSONL + rendered charts (gitignored)
-├── tests/                  # unit tests on the harness, NOT real LLM calls
-└── pyproject.toml          # uv-managed project
+# Or a fast single-conversation smoke (pipeline validation):
+uv run swb run --limit 1 -o results/smoke.json
 ```
 
-## Results
+### 5 runs and 10 runs (stability check / public benchmark)
 
-See [**RESULTS.md**](RESULTS.md) for the full apples-to-apples LoCoMo head-to-head: Statewave **0.469** macro-avg vs Mem0 **0.295** under Honcho's verbatim public-SOTA judge (full 1986-question run, adversarial excluded). The document walks through every methodology axis we tested, the four judge prompts we ran, what "Mem0 91.6% doesn't reproduce" actually means against their own cloud API, and what the honest LoCoMo ceiling looks like.
+Repeated-run aggregation is driven by a documented procedure over the real commands (there is no hidden `--runs` flag — see *Current limitations*). Execute N independent passes to N output files, then aggregate:
 
-## Reproducing the published numbers
+```bash
+# 5 runs (use 10 for the preferred public benchmark):
+for i in $(seq 1 5); do
+  uv run swb run -o "results/run-$i.json"
+done
 
-The numbers in [RESULTS.md](RESULTS.md) are reproducible from:
+# Per-run + mean + standard-deviation tables across the passes:
+uv run python scripts/aggregate_runs.py results/run-*.json
+```
 
-- The exact `uv.lock` in this repo (so re-running gives the same SDK versions)
-- The exact answer + judge model identifiers documented in RESULTS.md ("Reproducibility" section)
-- LoCoMo `data/locomo10.json` fetched from the canonical GitHub HEAD on first use (cached)
-- The JSONL artifacts in `results/` plus `scripts/honcho_rescore.py`
+`scripts/aggregate_runs.py` reads the `score` column each pass already wrote (it does not re-score), and reports each system's per-run score, the mean across runs, and the population standard deviation — the stability signal. It exits non-zero on a missing or unparseable file so a shell loop fails loudly rather than averaging a partial set.
 
-Anyone can re-run with `swb run` against their own keys and reproduce within sampling noise. If you can't, the numbers don't count — open an issue on `smaramwbc/statewave/issues` and we'll dig in.
+---
+
+## How results are scored
+
+For every question, each system retrieves context from its own memory of the conversation, the **same answer model** generates an answer from that context, and the answer is scored against the LoCoMo reference answer using the metric appropriate to the question category:
+
+| Category | Metric | Why |
+|---|---|---|
+| `single_hop` | Token-level **F1** (SQuAD normalization) | The reference is an unambiguous short factoid; token overlap is the right measure. |
+| `multi_hop`, `temporal`, `open_domain` | **LLM-as-judge** (CORRECT / INCORRECT → 1.0 / 0.0) | The reference is a natural-language explanation; token F1 penalizes correct-but-paraphrased answers. The judge model is deliberately different from the answer model to reduce same-model bias. |
+| `adversarial` | **Refusal judge** (REFUSAL / FABRICATION → 1.0 / 0.0) | The answer is not in the conversation; the correct behavior is to decline. F1 against an empty reference would score every correct refusal as zero. |
+
+- **Per-question score** is in `[0, 1]`. Every row in the JSONL records the question, category, reference answer, system prediction, score, the metric used, token counts, and latency.
+- **Overall score** = mean of per-question scores. `swb report` also reports a mean that **excludes the adversarial category** (the refusal-only subset; long-term-memory comparisons typically report the non-adversarial mean separately) and a per-category breakdown.
+- **Across runs**, `scripts/aggregate_runs.py` averages each run's overall (and excl-adversarial) score and reports the standard deviation. Averages are simple means over independent passes; no run is weighted differently.
+
+Default answer model: `claude-haiku-4-5`. Default judge model: `gpt-4o-2024-08-06`. Both are overridable (`SWB_ANSWER_MODEL`, `SWB_JUDGE_MODEL`) and recorded per row so a report always reflects the models actually used.
+
+---
+
+## Reproducibility
+
+To interpret or reproduce any number, capture all of:
+
+| Variable | Where it's recorded |
+|---|---|
+| Benchmark repo commit | `git rev-parse HEAD` in this repo |
+| Statewave version / commit | The Statewave server build under test (for the `statewave` system) |
+| Dataset | LoCoMo `data/locomo10.json`, fetched from the canonical [snap-research/LoCoMo](https://github.com/snap-research/LoCoMo) GitHub HEAD on first use, cached under `data/locomo/` |
+| Answer model | `answer_model` column in every JSONL row (default `claude-haiku-4-5`) |
+| Judge model | `SWB_JUDGE_MODEL` / default `gpt-4o-2024-08-06` |
+| Embedding model | Not selected by the bench — each system handles its own embeddings internally |
+| Scoring mode | `SWB_SCORING_MODE` (default `strict`) |
+| Number of runs | Number of independent `swb run` passes aggregated |
+| Date of run | Recorded in the rendered report metadata |
+| Environment | uv-locked Python deps (`uv.lock`); systems run against their own cloud/self-hosted backends |
+| Non-default config | Any `-s`, `--limit`, `SWB_*` overrides used |
+
+Anyone can re-run with their own keys and reproduce within sampling noise at the same run count. If you can't, the numbers don't count — open an issue on [`smaramwbc/statewave`](https://github.com/smaramwbc/statewave/issues).
+
+---
+
+## Interpreting the results
+
+- **Scores are benchmark signals, not absolute truth.** They measure performance on LoCoMo under one configuration, not universal capability.
+- **A 1-run result is directional only.** It validates the pipeline and gives a first signal; it is not a basis for strong claims.
+- **5-run and 10-run aggregates are for stability.** Trust a system-vs-system gap only when it exceeds the run-to-run standard deviation at that run count.
+- **Results depend on configuration.** The answer model, judge model, prompt, retrieval/budget config, embedding model, and dataset preprocessing all move scores. Two systems are only comparable when measured with the **same dataset, same models, same judge, same scoring mode, and same run count**.
+- **Cost and latency are part of the result.** A higher score at 25× the token cost is a different product decision than a comparable score at a fraction of it; the report surfaces tokens and latency alongside quality.
+
+---
+
+## Cost note
+
+A full pass makes real, billable LLM calls:
+
+- One answer-model call per question, every system (the shared answer model).
+- One judge-model call per LLM-judged / refusal-judged question.
+- Each system's own ingest calls (Mem0's fact extraction, Statewave's LLM compile, Zep's graph build) bill against that system's account; the bench records them under `internal_*` token columns so the full bill is visible.
+
+A single-conversation smoke (`--limit 1`) across all systems is roughly \$10–\$15. A full pass is proportionally larger; a 10-run public benchmark is 10× a full pass. Mem0 and Zep cloud free tiers cover smoke / pilot runs.
+
+---
+
+## Current limitations
+
+Documented honestly so results are not over-read:
+
+- **No native multi-run flag.** `swb run` executes one pass. The 5-/10-run workflow is the documented shell loop above plus `scripts/aggregate_runs.py`. A native `--runs` mode is *planned*, not yet implemented.
+- **`swb report` renders one JSONL.** Cross-run aggregation is `scripts/aggregate_runs.py`, which reports overall and excl-adversarial means + standard deviation across passes. Per-category cross-run aggregation in the rendered HTML is *planned*.
+- **Single-conversation smoke is not a public number.** `--limit 1` validates the pipeline on one conversation; it is not the full-dataset benchmark and is labelled as smoke wherever it appears.
+- **Stochastic dependencies.** Both the answer model and the judge are non-deterministic; some systems' retrieval is also non-deterministic run-to-run. This is exactly why the run-count framework exists — report variance, don't hide it.
+
+---
+
+## Disclaimer
+
+Benchmark results are intended as reproducible evaluation signals, not absolute claims of universal performance. Scores may vary depending on the model, judge, prompting strategy, retrieval configuration, dataset preprocessing, random seeds, and runtime environment. Results should only be compared against other systems when the same dataset, run count, model configuration, judge configuration, and scoring method are used. One-run results are provided for convenience and smoke testing; the 10-run aggregate is the preferred reporting format for public comparison.
+
+---
 
 ## Contributing
 
-Adapters for new memory systems are welcome — see `src/statewave_bench/systems/base.py` for the contract. New systems land via PR; we'll re-run the bench against them and update the published numbers.
+Adapters for new memory systems are welcome — see `src/statewave_bench/systems/base.py` for the contract. New systems land via PR; the bench is re-run against them and the published numbers updated.
 
 ## License
 

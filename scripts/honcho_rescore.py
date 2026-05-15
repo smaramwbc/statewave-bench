@@ -226,10 +226,11 @@ def main() -> int:
     # Load LoCoMo once to build the dia_id lookup. We use our own loader
     # (statewave_bench.dataset) which already preserves dia_id + speaker
     # on each turn — no re-download needed.
-    from statewave_bench.dataset import LocomoConversation, load_locomo
     from openai import OpenAI  # type: ignore[import-untyped]
 
-    print(f"Loading LoCoMo dataset…", file=sys.stderr)
+    from statewave_bench.dataset import LocomoConversation, load_locomo
+
+    print("Loading LoCoMo dataset…", file=sys.stderr)
     convs_by_id: dict[str, LocomoConversation] = {}
     qa_by_id: dict[tuple[str, int], object] = {}
     for c in load_locomo():
@@ -310,12 +311,8 @@ def main() -> int:
         per_cat[str(r["category"])].append(float(r["honcho_score"]))
 
     per_conv_means = {cid: sum(s) / len(s) for cid, s in per_conv.items() if s}
-    macro_avg = (
-        sum(per_conv_means.values()) / len(per_conv_means) if per_conv_means else 0.0
-    )
-    micro_avg = (
-        sum(float(r["honcho_score"]) for r in out_rows) / len(out_rows) if out_rows else 0.0
-    )
+    macro_avg = sum(per_conv_means.values()) / len(per_conv_means) if per_conv_means else 0.0
+    micro_avg = sum(float(r["honcho_score"]) for r in out_rows) / len(out_rows) if out_rows else 0.0
 
     print()
     print("=" * 70)
