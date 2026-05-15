@@ -95,21 +95,46 @@ ZEP_TASK_TIMEOUT_SEC = 180.0
 ZEP_TASK_POLL_INTERVAL_SEC = 2.0
 ZEP_TERMINAL_STATUSES = frozenset({"completed", "success", "succeeded", "failed", "error"})
 
-# Graph-extraction settle: poll get_user_context until its body length
-# doesn't change for N consecutive polls. 3 polls x 5s = 15s of
-# stability is empirically enough to declare the graph "stable enough"
-# on a 19-session LoCoMo conversation.
+# Graph-extraction settle: poll the SAME retrieval path `answer()` uses
+# (`graph.search` over edges) with a broad probe query, until the
+# returned edge set stops growing for N consecutive polls.
+#
+# CRITICAL FAIRNESS FIX: the previous implementation polled
+# `thread.get_user_context()` — the USER_SUMMARY rollup. That summary
+# stabilizes within ~15s (Zep generates it from an early partial
+# extraction), but the searchable EDGE graph that `graph.search`
+# queries keeps extracting for much longer. The settle detector
+# declared "graph ready" while `graph.search` still returned almost
+# nothing, so the bench scored all 199 questions against a half-built
+# graph and Zep collapsed to ~0.03 on every non-adversarial category.
+# A live `graph.search` probe of the same data minutes later returned
+# the correct facts — proving the graph was simply not query-ready at
+# score time. Polling the actual retrieval index is the only honest
+# readiness signal.
+#
+# Stability metric is (edge_count, total_fact_chars): edge count alone
+# can plateau while facts keep getting richer, and char length alone
+# can wobble on reranker nondeterminism. Requiring BOTH stable for N
+# polls is robust to each failure mode.
 ZEP_GRAPH_SETTLE_POLL_SEC = 5.0
 ZEP_GRAPH_SETTLE_STABLE_COUNT = 3
-# 900s — bumped again after the first --limit 10 run saw conv-41 and
-# conv-43 blow past the 480s budget with the graph still actively
-# growing (logged "zep graph still growing after 480s, refusing to
-# score against an unsettled graph"). 15 minutes is a lot of patience
-# but the settle detector exits early if the length stabilizes, so
-# this only costs real wall time on the conversations that genuinely
-# need it. Better to wait honestly than to lose 199 questions on an
-# ingest-failure exception that aborts the (system, conv) pair.
+# Minimum edges before "stable" counts. Guards the degenerate case
+# where `graph.search` returns 0 edges early in extraction and a
+# (0,0) signature would otherwise satisfy the stability check
+# instantly. A 19-session LoCoMo conversation produces dozens of
+# edges; 5 is a conservative "extraction has clearly started" floor.
+ZEP_GRAPH_SETTLE_MIN_EDGES = 5
+# 900s — a 19-session LoCoMo conversation's edge extraction can run
+# 60-180s+; the settle detector exits early once the edge set
+# stabilizes, so this ceiling only costs real wall time on the
+# conversations that genuinely need it. Better to wait honestly than
+# to score against an unsettled graph (the bug this fix exists for).
 ZEP_GRAPH_SETTLE_TIMEOUT_SEC = 900.0
+# Broad probe query for the settle poll. Generic enough to pull a wide
+# slice of the graph regardless of conversation content, so the
+# edge-count signal reflects overall extraction progress rather than
+# one narrow topic's readiness.
+ZEP_GRAPH_SETTLE_PROBE_QUERY = "summary of all events, facts, people, dates and activities"
 
 # graph.search retrieval budget — matches Statewave's 2048-token context
 # bundle at ~4 chars per token, so the answer model sees comparable
@@ -225,10 +250,12 @@ class ZepSystem(MemorySystem):
         self._wait_for_tasks(task_ids, conversation_id=conversation.id)
 
         # Tasks completing only means messages were ingested. The graph
-        # extractor keeps populating facts for another ~30-60s. Poll
-        # the assembled context until it stops growing for a few
-        # consecutive samples before declaring the graph "settled".
-        self._wait_for_graph_settle(thread_id=thread_id, conversation_id=conversation.id)
+        # EDGE extractor keeps populating facts for another ~60-180s.
+        # Poll the actual retrieval path (`graph.search` over edges,
+        # exactly what `answer()` uses) until the edge set stops growing
+        # for a few consecutive samples before declaring the graph
+        # "settled". user_id (not thread_id) is graph.search's scope key.
+        self._wait_for_graph_settle(user_id=user_id, conversation_id=conversation.id)
 
     def _wait_for_tasks(self, task_ids: list[str], *, conversation_id: str) -> None:
         if not task_ids:
@@ -273,36 +300,66 @@ class ZepSystem(MemorySystem):
                 f"score against a partial graph."
             )
 
-    def _wait_for_graph_settle(self, *, thread_id: str, conversation_id: str) -> None:
-        last_length: int | None = None
+    def _wait_for_graph_settle(self, *, user_id: str, conversation_id: str) -> None:
+        """Block until the searchable edge graph stops growing.
+
+        Polls `graph.search` — the EXACT call `answer()` uses — with a
+        broad probe query, and waits until BOTH the returned edge count
+        and the total fact-text length are stable for
+        `ZEP_GRAPH_SETTLE_STABLE_COUNT` consecutive polls.
+
+        This replaces the old `thread.get_user_context()` poll, which
+        watched the USER_SUMMARY rollup — a signal that stabilizes long
+        before the edge index is query-ready, causing the bench to
+        score Zep against a half-built graph. See the comment block on
+        `ZEP_GRAPH_SETTLE_*` for the full incident writeup.
+        """
+        last_sig: tuple[int, int] | None = None
         stable_count = 0
         elapsed = 0.0
         while elapsed < ZEP_GRAPH_SETTLE_TIMEOUT_SEC:
-            # `get_user_context` is the right "graph still growing?"
-            # probe — it returns the current assembled context whose
-            # length monotonically grows while extraction is running.
-            # Note: this is NOT what `answer()` uses for retrieval —
-            # that path uses `graph.search` so the bench queries the
-            # graph with the actual question. See `answer()`.
             try:
-                ctx = self._client.thread.get_user_context(thread_id)
-                body = ctx.context or ""
+                results = self._client.graph.search(
+                    query=ZEP_GRAPH_SETTLE_PROBE_QUERY,
+                    user_id=user_id,
+                    scope="edges",
+                    limit=ZEP_SEARCH_LIMIT,
+                    max_characters=ZEP_SEARCH_MAX_CHARS,
+                    reranker=ZEP_SEARCH_RERANKER,
+                    mmr_lambda=ZEP_SEARCH_MMR_LAMBDA,
+                )
             except Exception as e:
                 raise RuntimeError(
-                    f"zep graph-settle poll failed for {conversation_id} (thread={thread_id}): {e}"
+                    f"zep graph-settle poll failed for {conversation_id} (user={user_id}): {e}"
                 ) from e
-            length = len(body)
-            if last_length is not None and length == last_length:
+            edges = getattr(results, "edges", None) or []
+            edge_count = len(edges)
+            fact_chars = sum(len(getattr(e, "fact", "") or "") for e in edges)
+            sig = (edge_count, fact_chars)
+            # Non-empty floor: never declare an empty/near-empty graph
+            # "settled". Early in extraction `graph.search` returns 0
+            # edges; without this guard sig=(0,0) would be "stable" for
+            # 3 polls and exit immediately — the exact premature-settle
+            # bug, just relocated. A 19-session LoCoMo conversation
+            # yields dozens of edges; require at least a handful before
+            # stability counts.
+            if edge_count < ZEP_GRAPH_SETTLE_MIN_EDGES:
+                stable_count = 0
+                last_sig = sig
+                time.sleep(ZEP_GRAPH_SETTLE_POLL_SEC)
+                elapsed += ZEP_GRAPH_SETTLE_POLL_SEC
+                continue
+            if last_sig is not None and sig == last_sig:
                 stable_count += 1
                 if stable_count >= ZEP_GRAPH_SETTLE_STABLE_COUNT:
                     return
             else:
                 stable_count = 0
-            last_length = length
+            last_sig = sig
             time.sleep(ZEP_GRAPH_SETTLE_POLL_SEC)
             elapsed += ZEP_GRAPH_SETTLE_POLL_SEC
         raise RuntimeError(
-            f"zep graph still growing after {ZEP_GRAPH_SETTLE_TIMEOUT_SEC:.0f}s "
+            f"zep edge graph still growing after {ZEP_GRAPH_SETTLE_TIMEOUT_SEC:.0f}s "
             f"for {conversation_id}. Refusing to score against a graph that "
             f"hasn't settled."
         )
