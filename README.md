@@ -153,14 +153,18 @@ statewave-bench/
 └── pyproject.toml          # uv-managed project
 ```
 
+## Results
+
+See [**RESULTS.md**](RESULTS.md) for the full apples-to-apples LoCoMo head-to-head: Statewave **0.469** macro-avg vs Mem0 **0.295** under Honcho's verbatim public-SOTA judge (full 1986-question run, adversarial excluded). The document walks through every methodology axis we tested, the four judge prompts we ran, what "Mem0 91.6% doesn't reproduce" actually means against their own cloud API, and what the honest LoCoMo ceiling looks like.
+
 ## Reproducing the published numbers
 
-When this bench reaches a publishable run, the numbers committed to the README will include:
+The numbers in [RESULTS.md](RESULTS.md) are reproducible from:
 
-- The exact `uv.lock` used (so re-running gives the same SDK versions)
-- The exact answer + judge model identifiers
-- The HuggingFace dataset commit hash
-- A `results/published/<date>.jsonl` snapshot of every result row
+- The exact `uv.lock` in this repo (so re-running gives the same SDK versions)
+- The exact answer + judge model identifiers documented in RESULTS.md ("Reproducibility" section)
+- LoCoMo `data/locomo10.json` fetched from the canonical GitHub HEAD on first use (cached)
+- The JSONL artifacts in `results/` plus `scripts/honcho_rescore.py`
 
 Anyone can re-run with `swb run` against their own keys and reproduce within sampling noise. If you can't, the numbers don't count — open an issue on `smaramwbc/statewave/issues` and we'll dig in.
 
