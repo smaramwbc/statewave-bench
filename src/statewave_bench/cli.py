@@ -258,14 +258,33 @@ def _print_cost_estimate(est: CostEstimate) -> None:
     default=Path("data/locomo"),
     help="Where the LoCoMo dataset is cached. Reusable across runs.",
 )
+@click.option(
+    "--runs",
+    type=int,
+    default=1,
+    show_default=True,
+    help=(
+        "Number of independent full passes (the variance / stability "
+        "framework: 1 = smoke, 5 = stability check, 10 = preferred "
+        "public benchmark). With --runs > 1 each pass writes to its own "
+        "file: --output results/run.jsonl produces results/run-1.jsonl "
+        "... results/run-N.jsonl. Aggregate them with "
+        "`python scripts/aggregate_runs.py results/run-*.jsonl`."
+    ),
+)
 def run(
     systems: tuple[str, ...],
     limit: int | None,
     output: Path,
     resume: bool,
     cache_dir: Path,
+    runs: int,
 ) -> None:
     from .runner import run_bench  # imported here so `swb --help` doesn't pay the cost
+
+    if runs < 1:
+        console.print("[red]--runs must be >= 1.[/]")
+        sys.exit(2)
 
     requested = list(systems) if systems else _all_system_names()
     instances = []
@@ -278,29 +297,55 @@ def run(
         console.print("[red]No systems instantiated. Aborting.[/]")
         sys.exit(2)
 
-    # Fresh-by-default. The full chain — delete_subject() in every
-    # adapter, re-ingest, re-compile, re-retrieve, re-answer, re-score —
-    # only fires when the JSONL is empty for a given (system, conv) tuple.
-    # Carrying stale rows from a prior run means the bench short-circuits
-    # the ingest/compile path and you're not actually testing fixes to
-    # those layers. --resume opts back in to the resumable behavior.
-    if output.exists() and not resume:
-        output.unlink()
-        console.print(f"[yellow]Fresh run:[/] deleted previous {output}")
-    elif output.exists() and resume:
-        console.print(
-            "[yellow]Resume mode:[/] keeping existing results; "
-            "already-done (system, conv, q_idx) tuples will be skipped."
-        )
-
     console.print(f"Running {len(instances)} system(s): {', '.join(s.name for s in instances)}")
     if limit:
         console.print(f"[yellow]Pilot mode:[/] capping at {limit} conversations.")
+    if runs > 1:
+        console.print(
+            f"[bold]Multi-run:[/] {runs} independent passes "
+            f"({'stability check' if runs < 10 else 'public-benchmark tier'})."
+        )
 
-    conversations = load_locomo(cache_dir=cache_dir, limit=limit)
-    run_bench(systems=instances, conversations=conversations, output_path=output)
-    console.print(f"\n[green]Done.[/] Results in {output}")
-    console.print(f"Render with: [bold]swb report --input {output}[/]")
+    # One output file per pass when runs > 1 (results/run.jsonl ->
+    # results/run-1.jsonl ... run-N.jsonl). Single-run keeps the exact
+    # path the caller passed so existing scripts / docs are unchanged.
+    pass_paths = [
+        output if runs == 1 else output.with_stem(f"{output.stem}-{i}") for i in range(1, runs + 1)
+    ]
+
+    for i, pass_path in enumerate(pass_paths, start=1):
+        if runs > 1:
+            console.print(f"\n[bold cyan]── Pass {i}/{runs} → {pass_path} ──[/]")
+
+        # Fresh-by-default per pass. The full chain — delete_subject()
+        # in every adapter, re-ingest, re-compile, re-retrieve,
+        # re-answer, re-score — only fires when the JSONL is empty for
+        # a given (system, conv) tuple. Carrying stale rows means the
+        # bench short-circuits the ingest/compile path; --resume opts
+        # back in to the resumable behavior (per-pass).
+        if pass_path.exists() and not resume:
+            pass_path.unlink()
+            console.print(f"[yellow]Fresh run:[/] deleted previous {pass_path}")
+        elif pass_path.exists() and resume:
+            console.print(
+                "[yellow]Resume mode:[/] keeping existing results; "
+                "already-done (system, conv, q_idx) tuples will be skipped."
+            )
+
+        # load_locomo returns a one-shot generator — reload per pass so
+        # every pass sees the full dataset.
+        conversations = load_locomo(cache_dir=cache_dir, limit=limit)
+        run_bench(systems=instances, conversations=conversations, output_path=pass_path)
+
+    if runs == 1:
+        console.print(f"\n[green]Done.[/] Results in {output}")
+        console.print(f"Render with: [bold]swb report --input {output}[/]")
+    else:
+        glob = output.with_stem(f"{output.stem}-*")
+        console.print(
+            f"\n[green]Done.[/] {runs} passes written: {pass_paths[0]} … {pass_paths[-1]}"
+        )
+        console.print(f"Aggregate with: [bold]python scripts/aggregate_runs.py {glob}[/]")
 
 
 # ── `swb report` ──────────────────────────────────────────────────────────

@@ -123,6 +123,31 @@ def main() -> int:
         mean = statistics.fmean(clean) if clean else float("nan")
         std = statistics.pstdev(clean) if len(clean) > 1 else 0.0
         print(f"| {s} | {_fmt(mean)} | {std:.3f} | {len(clean)} |")
+
+    # Per-category cross-run aggregation. Reserved keys (overall,
+    # excl_adv) are not categories; everything else a run produced is.
+    reserved = {"overall", "excl_adv"}
+    categories = sorted(
+        {c for run in per_run for sysmap in run.values() for c in sysmap if c not in reserved}
+    )
+    if categories:
+        print()
+        print("## Mean per category across runs (stddev in parentheses)")
+        header = "| System | " + " | ".join(categories) + " |"
+        print(header)
+        print("|" + "---|" * (len(categories) + 1))
+        for s in systems:
+            cells: list[str] = []
+            for cat in categories:
+                vals = [run.get(s, {}).get(cat, float("nan")) for run in per_run]
+                clean = [v for v in vals if v == v]
+                if not clean:
+                    cells.append("—")
+                    continue
+                mean = statistics.fmean(clean)
+                std = statistics.pstdev(clean) if len(clean) > 1 else 0.0
+                cells.append(f"{mean:.3f} ({std:.3f})")
+            print(f"| {s} | " + " | ".join(cells) + " |")
     return 0
 
 

@@ -94,19 +94,17 @@ uv run swb run --limit 1 -o results/smoke.json
 
 ### 5 runs and 10 runs (stability check / public benchmark)
 
-Repeated-run aggregation is driven by a documented procedure over the real commands (there is no hidden `--runs` flag — see *Current limitations*). Execute N independent passes to N output files, then aggregate:
+`swb run --runs N` executes N independent full passes, each to its own file (`-o results/run.jsonl --runs 5` → `results/run-1.jsonl … run-5.jsonl`). Aggregate them with `scripts/aggregate_runs.py`:
 
 ```bash
-# 5 runs (use 10 for the preferred public benchmark):
-for i in $(seq 1 5); do
-  uv run swb run -o "results/run-$i.json"
-done
+# 5 runs (use --runs 10 for the preferred public benchmark):
+uv run swb run --runs 5 -o results/run.jsonl
 
-# Per-run + mean + standard-deviation tables across the passes:
-uv run python scripts/aggregate_runs.py results/run-*.json
+# Per-run + mean + stddev — overall, excl-adversarial, and per-category:
+uv run python scripts/aggregate_runs.py results/run-*.jsonl
 ```
 
-`scripts/aggregate_runs.py` reads the `score` column each pass already wrote (it does not re-score), and reports each system's per-run score, the mean across runs, and the population standard deviation — the stability signal. It exits non-zero on a missing or unparseable file so a shell loop fails loudly rather than averaging a partial set.
+`scripts/aggregate_runs.py` reads the `score` column each pass already wrote (it does not re-score) and reports, for every system: each run's score, the mean across runs, and the population standard deviation (the stability signal) — overall, excluding-adversarial, and per-category. It exits non-zero on a missing or unparseable file so the workflow fails loudly rather than averaging a partial set.
 
 ---
 
@@ -176,8 +174,7 @@ A single-conversation smoke (`--limit 1`) across all systems is roughly \$10–\
 
 Documented honestly so results are not over-read:
 
-- **No native multi-run flag.** `swb run` executes one pass. The 5-/10-run workflow is the documented shell loop above plus `scripts/aggregate_runs.py`. A native `--runs` mode is *planned*, not yet implemented.
-- **`swb report` renders one JSONL.** Cross-run aggregation is `scripts/aggregate_runs.py`, which reports overall and excl-adversarial means + standard deviation across passes. Per-category cross-run aggregation in the rendered HTML is *planned*.
+- **`swb report` renders one JSONL** (single pass). Cross-run aggregation — overall, excluding-adversarial, and per-category mean + standard deviation across N passes — is `scripts/aggregate_runs.py`. The rendered HTML report is per-pass; the cross-run view is the script's markdown output.
 - **Single-conversation smoke is not a public number.** `--limit 1` validates the pipeline on one conversation; it is not the full-dataset benchmark and is labelled as smoke wherever it appears.
 - **Stochastic dependencies.** Both the answer model and the judge are non-deterministic; some systems' retrieval is also non-deterministic run-to-run. This is exactly why the run-count framework exists — report variance, don't hide it.
 
