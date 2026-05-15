@@ -95,46 +95,87 @@ ZEP_TASK_TIMEOUT_SEC = 180.0
 ZEP_TASK_POLL_INTERVAL_SEC = 2.0
 ZEP_TERMINAL_STATUSES = frozenset({"completed", "success", "succeeded", "failed", "error"})
 
-# Graph-extraction settle: poll the SAME retrieval path `answer()` uses
-# (`graph.search` over edges) with a broad probe query, until the
-# returned edge set stops growing for N consecutive polls.
+# Graph-extraction settle: poll `graph.edge.get_by_user_id` — DIRECT
+# enumeration of the user's entire edge set — until the total edge
+# count stops growing for N consecutive polls.
 #
-# CRITICAL FAIRNESS FIX: the previous implementation polled
-# `thread.get_user_context()` — the USER_SUMMARY rollup. That summary
-# stabilizes within ~15s (Zep generates it from an early partial
-# extraction), but the searchable EDGE graph that `graph.search`
-# queries keeps extracting for much longer. The settle detector
-# declared "graph ready" while `graph.search` still returned almost
-# nothing, so the bench scored all 199 questions against a half-built
-# graph and Zep collapsed to ~0.03 on every non-adversarial category.
-# A live `graph.search` probe of the same data minutes later returned
-# the correct facts — proving the graph was simply not query-ready at
-# score time. Polling the actual retrieval index is the only honest
-# readiness signal.
+# CRITICAL FAIRNESS FIX (two iterations):
 #
-# Stability metric is (edge_count, total_fact_chars): edge count alone
-# can plateau while facts keep getting richer, and char length alone
-# can wobble on reranker nondeterminism. Requiring BOTH stable for N
-# polls is robust to each failure mode.
+#   v1 bug: polled `thread.get_user_context()` (the USER_SUMMARY
+#   rollup). That summary stabilizes within ~15s — Zep generates it
+#   from an early partial extraction — while the searchable graph keeps
+#   extracting for much longer. The bench scored all 199 questions
+#   against a half-built graph; Zep collapsed to ~0.03 on every
+#   non-adversarial category.
+#
+#   v2 bug: switched to polling `graph.search(limit=20)` (the actual
+#   retrieval path). But `graph.search` is relevance-capped at `limit`,
+#   so the returned edge count saturates at 20 almost instantly for
+#   any non-empty graph. (edge_count, fact_chars) stabilized while the
+#   graph was still extracting facts that mattered for SPECIFIC
+#   questions — same bug class, less severe. The canonical
+#   support-group question started passing (that fact extracts early)
+#   but sunrise/camping facts (extract later) were still scored 0
+#   while a live probe minutes later returned them correctly.
+#
+#   v3 (this): poll `graph.edge.get_by_user_id(user_id, limit=N)` —
+#   direct enumeration of the FULL edge set, not a relevance-capped
+#   search. The count grows during extraction (0 -> 50 -> 200 -> 476)
+#   and plateaus when done. No saturation, no query-dependence — the
+#   only honest "is the whole graph built" signal Zep's API exposes.
+#   (conv-26's settled graph has 476 edges; the default page size is
+#   100, so the fetch limit must be set well above any conversation's
+#   true edge count.)
+#
+#   Stability is detected by PLATEAU WITH TOLERANCE, not exact-count
+#   match and not strict-max. `get_by_user_id` returns a slightly
+#   different count on consecutive calls even on a fully-settled graph
+#   (Zep internal ordering / eventual-consistency wobble — observed
+#   474/476/475/478 on a static graph). Two naive checks both fail:
+#     - exact "N identical counts" almost never triggers on wobble
+#     - strict running-max resets the streak every time wobble pokes a
+#       new high (478 > 476), so it never plateaus either (observed:
+#       351s+ to settle a static graph, then no settle at all).
+#   So we track a `plateau_base` and only treat a poll as REAL growth
+#   when it exceeds the base by more than `_settle_tolerance(base)` —
+#   a band wide enough to swallow consistency wobble (a handful of
+#   edges) but far below a genuine extraction burst (LoCoMo adds
+#   dozens of edges per burst). Real growth resets the base + streak;
+#   in-band wobble advances the streak. Settles in ~30s on a done
+#   graph, waits honestly while edges are still being added.
 ZEP_GRAPH_SETTLE_POLL_SEC = 5.0
-ZEP_GRAPH_SETTLE_STABLE_COUNT = 3
-# Minimum edges before "stable" counts. Guards the degenerate case
-# where `graph.search` returns 0 edges early in extraction and a
-# (0,0) signature would otherwise satisfy the stability check
-# instantly. A 19-session LoCoMo conversation produces dozens of
-# edges; 5 is a conservative "extraction has clearly started" floor.
+# 5 (not 3): an in-band streak of 5 polls = 25s of no real growth.
+# LoCoMo edge extraction arrives in bursts; gaps between bursts are
+# typically <25s, so 5 avoids exiting in a mid-extraction lull while
+# still settling a truly-done graph in ~30s.
+ZEP_GRAPH_SETTLE_STABLE_COUNT = 5
+# Plateau tolerance band. A poll only counts as REAL growth (resetting
+# the plateau streak) when edge_count exceeds plateau_base by more
+# than max(absolute, relative * base). Consistency wobble is a handful
+# of edges; a genuine extraction burst is dozens. 15 absolute + 4%
+# relative cleanly separates them across conversation sizes (conv-26:
+# 4% of 476 ~= 19, so any single poll within ~19 of the base is
+# treated as wobble, not growth).
+ZEP_GRAPH_SETTLE_TOLERANCE_ABS = 15
+ZEP_GRAPH_SETTLE_TOLERANCE_REL = 0.04
+# Minimum edges before the plateau detector starts. Guards the
+# degenerate case where early 0-edge polls would look like a plateau
+# and exit instantly. A 19-session LoCoMo conversation produces
+# hundreds of edges; 5 is a conservative "extraction has started"
+# floor.
 ZEP_GRAPH_SETTLE_MIN_EDGES = 5
+# Edge-fetch page size for the settle poll. Must exceed any single
+# conversation's true edge count or the count saturates at the page
+# cap and we get the v2 saturation bug again. conv-26 settles at 476
+# edges; 2000 is generous headroom for denser conversations while
+# still one cheap API call per poll.
+ZEP_SETTLE_EDGE_FETCH_LIMIT = 2000
 # 900s — a 19-session LoCoMo conversation's edge extraction can run
-# 60-180s+; the settle detector exits early once the edge set
-# stabilizes, so this ceiling only costs real wall time on the
+# 60-180s+; the settle detector exits early once the edge count
+# plateaus, so this ceiling only costs real wall time on the
 # conversations that genuinely need it. Better to wait honestly than
 # to score against an unsettled graph (the bug this fix exists for).
 ZEP_GRAPH_SETTLE_TIMEOUT_SEC = 900.0
-# Broad probe query for the settle poll. Generic enough to pull a wide
-# slice of the graph regardless of conversation content, so the
-# edge-count signal reflects overall extraction progress rather than
-# one narrow topic's readiness.
-ZEP_GRAPH_SETTLE_PROBE_QUERY = "summary of all events, facts, people, dates and activities"
 
 # graph.search retrieval budget — matches Statewave's 2048-token context
 # bundle at ~4 chars per token, so the answer model sees comparable
@@ -301,61 +342,68 @@ class ZepSystem(MemorySystem):
             )
 
     def _wait_for_graph_settle(self, *, user_id: str, conversation_id: str) -> None:
-        """Block until the searchable edge graph stops growing.
+        """Block until the user's edge graph stops growing.
 
-        Polls `graph.search` — the EXACT call `answer()` uses — with a
-        broad probe query, and waits until BOTH the returned edge count
-        and the total fact-text length are stable for
-        `ZEP_GRAPH_SETTLE_STABLE_COUNT` consecutive polls.
+        Polls `graph.edge.get_by_user_id` — DIRECT enumeration of the
+        user's entire edge set — and waits until the total edge count
+        is stable for `ZEP_GRAPH_SETTLE_STABLE_COUNT` consecutive polls.
 
-        This replaces the old `thread.get_user_context()` poll, which
-        watched the USER_SUMMARY rollup — a signal that stabilizes long
-        before the edge index is query-ready, causing the bench to
-        score Zep against a half-built graph. See the comment block on
-        `ZEP_GRAPH_SETTLE_*` for the full incident writeup.
+        This is the v3 readiness signal. v1 watched the USER_SUMMARY
+        rollup (stabilizes ~15s before the graph is query-ready); v2
+        watched `graph.search(limit=20)` (count saturates at 20
+        instantly, masking ongoing extraction). Direct edge
+        enumeration is the only honest "whole graph built" signal Zep
+        exposes. Stability is plateau-with-tolerance (no growth beyond
+        a wobble band for N consecutive polls), NOT exact-count match
+        and NOT strict-max — see the `ZEP_GRAPH_SETTLE_*` comment block
+        for the full incident writeup including the count-wobble
+        rationale.
         """
-        last_sig: tuple[int, int] | None = None
-        stable_count = 0
+        plateau_base: int | None = None
+        in_band_streak = 0
         elapsed = 0.0
         while elapsed < ZEP_GRAPH_SETTLE_TIMEOUT_SEC:
             try:
-                results = self._client.graph.search(
-                    query=ZEP_GRAPH_SETTLE_PROBE_QUERY,
-                    user_id=user_id,
-                    scope="edges",
-                    limit=ZEP_SEARCH_LIMIT,
-                    max_characters=ZEP_SEARCH_MAX_CHARS,
-                    reranker=ZEP_SEARCH_RERANKER,
-                    mmr_lambda=ZEP_SEARCH_MMR_LAMBDA,
+                edges = self._client.graph.edge.get_by_user_id(
+                    user_id,
+                    limit=ZEP_SETTLE_EDGE_FETCH_LIMIT,
                 )
             except Exception as e:
                 raise RuntimeError(
                     f"zep graph-settle poll failed for {conversation_id} (user={user_id}): {e}"
                 ) from e
-            edges = getattr(results, "edges", None) or []
-            edge_count = len(edges)
-            fact_chars = sum(len(getattr(e, "fact", "") or "") for e in edges)
-            sig = (edge_count, fact_chars)
-            # Non-empty floor: never declare an empty/near-empty graph
-            # "settled". Early in extraction `graph.search` returns 0
-            # edges; without this guard sig=(0,0) would be "stable" for
-            # 3 polls and exit immediately — the exact premature-settle
-            # bug, just relocated. A 19-session LoCoMo conversation
-            # yields dozens of edges; require at least a handful before
-            # stability counts.
-            if edge_count < ZEP_GRAPH_SETTLE_MIN_EDGES:
-                stable_count = 0
-                last_sig = sig
-                time.sleep(ZEP_GRAPH_SETTLE_POLL_SEC)
-                elapsed += ZEP_GRAPH_SETTLE_POLL_SEC
-                continue
-            if last_sig is not None and sig == last_sig:
-                stable_count += 1
-                if stable_count >= ZEP_GRAPH_SETTLE_STABLE_COUNT:
-                    return
+            edge_count = len(edges) if edges else 0
+            # Non-empty floor: don't let the plateau detector start
+            # while the edge set is still empty/trivial (extraction
+            # hasn't really begun). Without this, an early run of
+            # 0-edge polls would look like a "plateau" and exit
+            # instantly — the exact premature-settle bug.
+            if plateau_base is None:
+                if edge_count < ZEP_GRAPH_SETTLE_MIN_EDGES:
+                    time.sleep(ZEP_GRAPH_SETTLE_POLL_SEC)
+                    elapsed += ZEP_GRAPH_SETTLE_POLL_SEC
+                    continue
+                plateau_base = edge_count
+            tolerance = max(
+                ZEP_GRAPH_SETTLE_TOLERANCE_ABS,
+                int(ZEP_GRAPH_SETTLE_TOLERANCE_REL * plateau_base),
+            )
+            if edge_count > plateau_base + tolerance:
+                # Real extraction growth (burst of dozens of edges):
+                # rebase the plateau and reset the streak.
+                plateau_base = edge_count
+                in_band_streak = 0
             else:
-                stable_count = 0
-            last_sig = sig
+                # Within the wobble band of the base (or below it):
+                # extraction has stopped producing meaningful new
+                # edges. Track the high end of the band so the base
+                # reflects the true ceiling, but DON'T reset the
+                # streak — wobble is not growth.
+                if edge_count > plateau_base:
+                    plateau_base = edge_count
+                in_band_streak += 1
+                if in_band_streak >= ZEP_GRAPH_SETTLE_STABLE_COUNT:
+                    return
             time.sleep(ZEP_GRAPH_SETTLE_POLL_SEC)
             elapsed += ZEP_GRAPH_SETTLE_POLL_SEC
         raise RuntimeError(
