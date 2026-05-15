@@ -200,52 +200,47 @@ class StatewaveSystem(MemorySystem):
         # bundle (~2300 tokens, blends profile_fact + episode_summary).
         #
         # Experimental opt-in (env var STATEWAVE_BENCH_DIGEST=1): build
-        # a hybrid bundle = precomputed subject_digest + atomic facts +
+        # a hybrid bundle = topic_conclusions + atomic facts +
         # episode_summaries. Two shapes available via
         # STATEWAVE_BENCH_DIGEST_MODE:
         #
-        #   compact (default): digest + 5 facts + 2 summaries (~560 tok)
-        #     - Tuned for cost-sensitive deployments. Mean 0.452 macro
-        #       on the full LoCoMo bench under Honcho's verbatim judge.
-        #     - Wins multi_hop (digest's cross-fact synthesis); slightly
-        #       under-indexes open_domain (would benefit from more raw
-        #       conversational context).
+        #   compact (default): 2 topic_conclusions + 5 facts + 2 summaries
+        #     (~600 tok). Tuned for cost-sensitive deployments.
         #
-        #   fat: digest + 15 facts + 6 summaries (~2000 tok)
-        #     - Tuned to close the compression gap vs Honcho's full-
-        #       context baseline (75.4% under the same judge). 4x the
-        #       tokens but expected to lift open_domain materially —
-        #       the categories that benefit most from broader raw
-        #       conversational context. Hypothesis: lifts overall macro
-        #       from 0.45 to 0.60+.
+        #   fat: 3 topic_conclusions + 15 facts + 6 summaries
+        #     (~1500 tok). Trades budget for broader synthesis context.
         #
-        # The digest itself is a ~250-token coherent prose paragraph
-        # emitted once per compile by the LLM compiler (cross-fact
-        # identity, key dated events, themes, relationships,
-        # trajectory). Pre-computing that synthesis at compile lets
-        # retrieval ship a focused prompt instead of re-deriving it on
-        # every query.
+        # `topic_conclusion` memories are emitted once per compile by
+        # the LLM compiler's clustering pass: extracted profile_facts
+        # are grouped into 4-10 thematic topics ("career", "family",
+        # "health", etc), and each topic gets a ~200-token essay
+        # synthesizing what we know about the subject within that
+        # topic. Retrieval semantically matches the question to a
+        # topic and returns the pre-computed conclusion — saving
+        # answer-time work and producing richer cross-fact synthesis
+        # than scattered atomic facts alone.
         #
-        # Previously-tried-and-rejected variant ("path-3"), an intent-
-        # routed bundle that diverted "when did X" questions to a
-        # summary-heavy shape, regressed multi_hop 6.5pp on the full
-        # bench because atomic facts already include absolute dates
-        # ("on 23 June 2023") — cutting facts to add summaries lost the
-        # precise temporal signal. Keep the balanced shape; the fat
-        # mode trades budget, not signal mix.
+        # Phase 2 redesign note: an earlier "session_digest" variant
+        # (Phase 1) was rejected because it overlapped too much with
+        # episode_summary — same per-session paraphrase axis, just a
+        # different prompt. topic_conclusion uses the CROSS-SESSION
+        # axis (a topic spans every session it appears in), producing
+        # content that doesn't exist in any other memory kind.
         if os.environ.get("STATEWAVE_BENCH_DIGEST") == "1":
             digest_mode = os.environ.get("STATEWAVE_BENCH_DIGEST_MODE", "compact").lower()
             if digest_mode == "fat":
-                fact_limit, summary_limit, summary_trim_chars = 15, 6, 500
+                topic_limit, fact_limit, summary_limit, summary_trim_chars = 3, 15, 6, 500
             else:
                 # "compact" or any unrecognized value — fall back to the
-                # well-tested balanced bundle.
-                fact_limit, summary_limit, summary_trim_chars = 5, 2, 300
+                # balanced bundle.
+                topic_limit, fact_limit, summary_limit, summary_trim_chars = 2, 5, 2, 300
 
-            digest = self._client.search_memories(
+            topics = self._client.search_memories(
                 subject_id,
-                kind="subject_digest",
-                limit=1,
+                kind="topic_conclusion",
+                query=question,
+                semantic=True,
+                limit=topic_limit,
             )
             facts = self._client.search_memories(
                 subject_id,
@@ -262,8 +257,12 @@ class StatewaveSystem(MemorySystem):
                 limit=summary_limit,
             )
             digest_sections: list[str] = []
-            if digest.memories:
-                digest_sections.append(f"## About the subject\n{digest.memories[0].content}")
+            if topics.memories:
+                topic_lines: list[str] = []
+                for m in topics.memories:
+                    topic_name = (m.metadata or {}).get("topic") or "topic"
+                    topic_lines.append(f"### {topic_name}\n{m.content}")
+                digest_sections.append("## Subject topics\n" + "\n\n".join(topic_lines))
             if facts.memories:
                 fact_lines = "\n".join(f"- {m.content}" for m in facts.memories)
                 digest_sections.append(f"## Relevant facts\n{fact_lines}")
