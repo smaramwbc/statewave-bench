@@ -1,0 +1,30 @@
+# Issue Template Configuration
+# https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/configuring-issue-templates-for-your-repository
+#
+# Note: this repository's Issues tab is disabled — all issues route to the
+# central tracker on smaramwbc/statewave. The contact_links below are kept
+# for symbolic parity with the lead repo.
+
+blank_issues_enabled: false
+
+contact_links:
+  - name: 🐛 Bug or feature request
+    url: https://github.com/smaramwbc/statewave/issues/new/choose
+    about: |
+      File bench bugs / feature requests on the central tracker.
+      Use the prefix [bench] in the title.
+
+  - name: 🔒 Security Vulnerability
+    url: https://github.com/smaramwbc/statewave-bench/security/policy
+    about: |
+      Report security vulnerabilities privately. Do NOT open a public issue.
+
+  - name: 💬 Questions & Discussions
+    url: https://github.com/smaramwbc/statewave/discussions
+    about: |
+      Ask questions about the bench, results, or new evaluations.
+
+  - name: 📖 Documentation
+    url: https://github.com/smaramwbc/statewave-bench/blob/main/README.md
+    about: |
+      How to run the bench, headline numbers, methodology.
