@@ -9,7 +9,7 @@ Statewave Bench measures how well a memory layer lets an LLM answer questions ac
 
 > 📋 **Issues & feature requests** for the entire Statewave workspace are tracked centrally on [`smaramwbc/statewave`](https://github.com/smaramwbc/statewave/issues). Issues are disabled on this repo so all reports funnel to one place.
 
-📊 **Latest results:** see [RESULTS.md](RESULTS.md).
+📊 **Results:** the benchmark is actively being run and published **run by run** — see [RESULTS.md](RESULTS.md).
 
 ---
 
