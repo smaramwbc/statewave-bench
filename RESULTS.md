@@ -10,6 +10,8 @@ Long-term conversational memory, measured on the public [LoCoMo](https://github.
 
 No scores are published yet — by design. A single pass is one sample from a stochastic distribution (both the answer model and the LLM-as-judge are non-deterministic, and some systems' retrieval is non-deterministic between passes). Publishing one pass as "the" result would misrepresent a system-vs-system comparison. Numbers will appear here as they are produced and reviewed, pass by pass, with the run count and standard deviation stated alongside them.
 
+Every number published here will satisfy the harness's **publication-safety** bar: 100% scored coverage with the *same* question set across all systems, no `judge_failed`/null rows, the comparison mode (`vendor_defaults` / `equal_context_budget`) stated, each system's actual measured context size shown, and the run's metadata sidecar attached. The report tool refuses to render headline rankings otherwise. See [README.md](README.md#fair-comparison--publication-safety) for the full methodology.
+
 ---
 
 ## Run modes

@@ -126,6 +126,44 @@ Default answer model: `claude-haiku-4-5`. Default judge model: `gpt-4o-2024-08-0
 
 ---
 
+## Fair comparison & publication safety
+
+A benchmark number is only trustworthy if every system answered the **same** questions and nothing silently dropped out. The harness enforces this:
+
+- **No item disappears from the denominator.** Every attempted `(system, conversation, question)` produces a row. If ingest fails, the answer call raises, it times out, or the failure circuit-breaker aborts a conversation, the runner writes an explicit **`score: 0.0`, `metric: "system_failed"`** row carrying `error_type` (`ingest_failed | retrieval_failed | answer_failed | timeout | system_error`) and a short `error_message`. A crash counts as a wrong answer — it is never removed from the average.
+- **Judge failures are incomplete, not zero.** If the answer succeeds but the judge call fails after retries, the row is written with **`score: null`, `metric: "judge_failed"`**. Null scores are excluded from means (a judge outage must not look like a system getting answers wrong) — and their presence **blocks headline reporting** (below). Use `swb rescore` to retry only the judge without re-spending on the answer model.
+- **Coverage is reported, every run.** `swb report` prints a per-system table: `expected / completed / scored / failed / judge_failed`, plus `coverage = completed/expected` and `scored_coverage = scored/expected`. A result is publication-safe only at 100% scored coverage with equal question sets.
+- **Incomplete or unequal runs are blocked by default.** If any system is missing questions other systems answered, or any `judge_failed`/null row exists, `swb report` and `scripts/aggregate_runs.py` **refuse to render headline rankings** and exit non-zero. Pass `--allow-incomplete` to render anyway — the output is then loudly stamped **NOT PUBLICATION-SAFE** and ranking is suppressed. `aggregate_runs.py` additionally refuses runs that don't cover the same question set.
+- **Every run writes metadata.** A sidecar `results/<stem>.metadata.json` records timestamp, git commit, dataset URL, conversation/question counts, selected systems, scoring mode, answer/judge models, bench mode, and every retrieval/scoring-affecting env var. The HTML report surfaces the key fields. A run without metadata is treated as un-audited.
+
+### Comparison modes
+
+Systems expose retrieval limits in different units (Statewave: token budget; Zep: character/edge budget; Mem0: `top_k`). `swb run --mode` (or `SWB_BENCH_MODE`) makes the comparison axis explicit and records it in metadata:
+
+| Mode | Question it answers |
+|---|---|
+| `vendor_defaults` (default) | "How do they compare as shipped?" Context sizes are wildly unequal — **not** an equal-cost comparison; the report says so. |
+| `equal_context_budget` | "At a fixed context cost, which retrieves best?" Every system targets ~2k tokens (operator-set knobs are never overridden). |
+
+Because the per-system knobs are coarse proxies, **every row records the actual delivered context** — `retrieved_context_chars`, `retrieved_context_tokens_estimate` (documented ~4-chars/token approximation, applied identically to every system), `retrieved_items_count` — and the report shows average context size per system. The nominal budget is a label; the measured size is the truth. Zep cannot exceed its `graph.search` ceiling (~1,180 tokens); above that it is under-budget and must be annotated, not silently mismeasured (`scripts/budget_sweep.py` handles this).
+
+### Reproducing a run
+
+```bash
+# Equal-budget full pass, all systems, then a publication-safe report:
+uv run swb run --mode equal_context_budget -o results/run.jsonl
+uv run swb report -i results/run.jsonl          # refuses if not publication-safe
+# Multi-run aggregate (the preferred public number):
+uv run swb run --runs 10 -o results/run.jsonl
+uv run python scripts/aggregate_runs.py results/run-*.jsonl
+```
+
+Env vars that change results (all captured in metadata): `SWB_BENCH_MODE`, `SWB_SCORING_MODE`, `SWB_ANSWER_MODEL`, `SWB_JUDGE_MODEL`, `SWB_STATEWAVE_CONTEXT_MAX_TOKENS`, `MEM0_TOP_K`, `SWB_ZEP_SEARCH_LIMIT`, `SWB_ZEP_SEARCH_MAX_CHARS`, `SWB_NAIVE_WINDOW_SIZE`, `STATEWAVE_BENCH_DIGEST`, `STATEWAVE_BENCH_DIGEST_MODE`, `STATEWAVE_BENCH_HYBRID`, `LOCOMO_DATASET_URL`.
+
+> **Publication-safety disclaimer.** Numbers are not publication-safe unless coverage is 100% with equal question sets across systems, no `judge_failed`/null rows remain, and the run's metadata sidecar is attached. `--allow-incomplete` output is for debugging only and is stamped accordingly.
+
+---
+
 ## Reproducibility
 
 To interpret or reproduce any number, capture all of:

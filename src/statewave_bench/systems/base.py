@@ -67,6 +67,12 @@ class AnswerResult:
     # zero' from 'didn't report' via per-system metadata.
     internal_input_tokens: int = 0
     internal_output_tokens: int = 0
+    # Optional: how many discrete memory/context items the system put in
+    # front of the answer model (facts, edges, turns, chunks). Reported
+    # so a reader can see "system A used 30 items, system B used 4" even
+    # at the same token budget. None = the adapter didn't report it; the
+    # runner still derives char/token size from `retrieved_context`.
+    retrieved_items_count: int | None = None
 
 
 class MemorySystem(ABC):

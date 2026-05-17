@@ -272,6 +272,30 @@ def _print_cost_estimate(est: CostEstimate) -> None:
         "`python scripts/aggregate_runs.py results/run-*.jsonl`."
     ),
 )
+@click.option(
+    "--mode",
+    type=click.Choice(["vendor_defaults", "equal_context_budget"]),
+    default=None,
+    help=(
+        "Comparison mode (also via SWB_BENCH_MODE; default "
+        "vendor_defaults). 'vendor_defaults' = each system as shipped "
+        "(unequal context sizes — NOT an equal-cost comparison). "
+        "'equal_context_budget' = every system targets ~2k tokens; the "
+        "report shows each system's ACTUAL measured context size. "
+        "Recorded in the run metadata either way."
+    ),
+)
+@click.option(
+    "--keep-judge-failed",
+    is_flag=True,
+    default=False,
+    help=(
+        "On --resume, treat existing judge_failed/null-score rows as "
+        "final and skip them. Default: re-attempt them (answer + judge). "
+        "Use `swb rescore` to retry only the judge without re-spending "
+        "on the answer model."
+    ),
+)
 def run(
     systems: tuple[str, ...],
     limit: int | None,
@@ -279,12 +303,30 @@ def run(
     resume: bool,
     cache_dir: Path,
     runs: int,
+    mode: str | None,
+    keep_judge_failed: bool,
 ) -> None:
+    from .dataset import DEFAULT_LOCOMO_URL
+    from .modes import apply_mode_env, resolve_mode
     from .runner import run_bench  # imported here so `swb --help` doesn't pay the cost
 
     if runs < 1:
         console.print("[red]--runs must be >= 1.[/]")
         sys.exit(2)
+
+    try:
+        bench_mode = resolve_mode(mode)
+    except ValueError as e:
+        console.print(f"[red]{e}[/]")
+        sys.exit(2)
+    # Seed equal-context knob env BEFORE systems are instantiated — the
+    # adapters read their budget knobs at construction. No-op (and never
+    # overrides an explicit operator value) for vendor_defaults.
+    seeded = apply_mode_env(bench_mode)
+    console.print(
+        f"[bold]Mode:[/] {bench_mode}" + (f"  (seeded {', '.join(seeded)})" if seeded else "")
+    )
+    dataset_url = os.environ.get("LOCOMO_DATASET_URL", DEFAULT_LOCOMO_URL)
 
     requested = list(systems) if systems else _all_system_names()
     instances = []
@@ -335,7 +377,15 @@ def run(
         # load_locomo returns a one-shot generator — reload per pass so
         # every pass sees the full dataset.
         conversations = load_locomo(cache_dir=cache_dir, limit=limit)
-        run_bench(systems=instances, conversations=conversations, output_path=pass_path)
+        run_bench(
+            systems=instances,
+            conversations=conversations,
+            output_path=pass_path,
+            keep_judge_failed=keep_judge_failed,
+            bench_mode=bench_mode,
+            dataset_url=dataset_url,
+            dataset_cache_path=str(cache_dir / "locomo10.json"),
+        )
 
     if runs == 1:
         console.print(f"\n[green]Done.[/] Results in {output}")
@@ -364,10 +414,35 @@ def run(
     type=click.Path(file_okay=False, path_type=Path),
     default=Path("results"),
 )
-def report(input_path: Path, output_dir: Path) -> None:
-    from .report import render_report
+@click.option(
+    "--allow-incomplete",
+    is_flag=True,
+    default=False,
+    help=(
+        "Render even when the run is not publication-safe — judge_failed/"
+        "null-score rows present, or systems answered unequal question "
+        "sets. Default: fail with a clear error. When set, the report is "
+        "rendered but loudly stamped NOT PUBLICATION-SAFE and headline "
+        "ranking is suppressed."
+    ),
+)
+def report(input_path: Path, output_dir: Path, allow_incomplete: bool) -> None:
+    from .report import IncompleteResultsError, render_report
 
-    render_report(results_path=input_path, output_dir=output_dir)
+    try:
+        render_report(
+            results_path=input_path,
+            output_dir=output_dir,
+            allow_incomplete=allow_incomplete,
+        )
+    except IncompleteResultsError as e:
+        console.print(f"\n[red]✗ Refusing to render a publication-unsafe report:[/]\n{e}")
+        console.print(
+            "\nRe-run with [bold]--allow-incomplete[/] to render anyway "
+            "(it will be stamped NOT PUBLICATION-SAFE), or fix the run "
+            "(`swb rescore` for judge_failed rows; re-run missing systems)."
+        )
+        sys.exit(2)
     console.print("[green]Report written:[/]")
     console.print(f"  - {output_dir}/results-summary.md  (markdown table, paste into READMEs)")
     console.print(f"  - {output_dir}/results.html        (combined modern report)")

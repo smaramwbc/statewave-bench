@@ -21,6 +21,7 @@ zero-config.
 
 from __future__ import annotations
 
+import io
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,39 +29,144 @@ from pathlib import Path
 import altair as alt
 import polars as pl
 
-# Consistent color per system across every chart so the same vendor
-# isn't a different color in two side-by-side images. Statewave
-# deliberately uses a strong purple — it's the project the bench
-# was written for and the eye should land on it first. Other vendors
-# get distinct but more neutral tones; no_memory sits in slate so it
-# reads as "the floor" without competing for attention.
-SYSTEM_COLORS: dict[str, str] = {
-    "statewave": "#7c3aed",
-    "mem0": "#0891b2",
-    "zep": "#059669",
-    "naive": "#d97706",
-    "no_memory": "#94a3b8",
-}
+from .coverage import (
+    compute_coverage,
+    dedupe_rows,
+    has_incomplete,
+    missing_per_system,
+)
+from .metadata import load_metadata
+
+# Neutral, colour-vision-deficiency-safe categorical palette (Okabe-Ito
+# subset). Assigned to systems in sorted-name order so the mapping is
+# deterministic and identical across every chart — no system is given a
+# deliberately prominent or muted colour. `no_memory` is not special-cased.
+_NEUTRAL_PALETTE = [
+    "#0072B2",
+    "#E69F00",
+    "#009E73",
+    "#CC79A7",
+    "#56B4E9",
+    "#D55E00",
+    "#999999",
+]
+
+
+def _system_colors(systems: list[str]) -> dict[str, str]:
+    """Deterministic colour per system by sorted name — neutral, no
+    vendor is visually privileged."""
+    return {s: _NEUTRAL_PALETTE[i % len(_NEUTRAL_PALETTE)] for i, s in enumerate(sorted(systems))}
+
+
+class IncompleteResultsError(RuntimeError):
+    """Raised when a results set is not publication-safe (judge_failed/
+    null-score rows present, or systems answered unequal question sets)
+    and the caller did not pass allow_incomplete=True."""
+
+
+def _load_rows(results_path: Path) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    with results_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue  # tolerate a partial last line
+    return rows
+
+
+def _coverage_report(rows: list[dict[str, object]]) -> str:
+    """Human-readable per-system coverage block — the publication-safety
+    audit a reviewer reads before trusting any number."""
+    stats = compute_coverage(rows)
+    lines = [
+        "| System | Expected | Completed | Scored | Failed | Judge-failed | "
+        "Coverage | Scored cov. |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for s in sorted(stats):
+        c = stats[s]
+        lines.append(
+            f"| {s} | {c.expected_questions} | {c.completed_rows} | {c.scored_rows} | "
+            f"{c.failed_rows} | {c.judge_failed_rows} | "
+            f"{c.coverage:.1%} | {c.scored_coverage:.1%} |"
+        )
+    return "\n".join(lines)
+
+
+def _publication_safety(rows: list[dict[str, object]]) -> tuple[bool, list[str]]:
+    """(safe, problems). Safe iff equal question sets across systems AND
+    no judge_failed/null rows AND every system fully scored."""
+    problems: list[str] = []
+    missing = missing_per_system(rows)
+    if missing:
+        for sys_, keys in sorted(missing.items()):
+            sample = sorted(keys)[:5]
+            problems.append(
+                f"system '{sys_}' is missing {len(keys)} expected question(s) "
+                f"(e.g. {sample}{' …' if len(keys) > 5 else ''})"
+            )
+    if has_incomplete(rows):
+        stats = compute_coverage(rows)
+        jf = {s: c.judge_failed_rows for s, c in stats.items() if c.judge_failed_rows}
+        problems.append(
+            "judge_failed / null-score rows present "
+            f"({sum(jf.values())} across {', '.join(sorted(jf)) or 'unknown'}); "
+            "run `swb rescore` to retry the judge"
+        )
+    return (not problems), problems
 
 
 def render_report(
     *,
     results_path: Path,
     output_dir: Path,
+    allow_incomplete: bool = False,
 ) -> None:
-    """Read `results_path` (JSONL), write summary + combined HTML to `output_dir`."""
+    """Read `results_path` (JSONL), validate publication-safety, then
+    write summary + combined HTML to `output_dir`.
+
+    Refuses (raises `IncompleteResultsError`) when the run has
+    judge_failed/null rows or systems answered unequal question sets,
+    unless `allow_incomplete=True` — in which case the report is still
+    rendered but stamped NOT PUBLICATION-SAFE and headline ranking is
+    suppressed."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    df = pl.read_ndjson(results_path)
-    if df.is_empty():
+    raw_rows = _load_rows(results_path)
+    if not raw_rows:
         raise SystemExit(f"No rows found in {results_path}.")
+
+    # Collapse resume-duplicate (system, conv, q_idx) rows to the most
+    # complete one before anything is counted.
+    rows = dedupe_rows(raw_rows)
+
+    safe, problems = _publication_safety(rows)
+    if not safe and not allow_incomplete:
+        raise IncompleteResultsError(
+            "\n".join(f"  - {p}" for p in problems)
+            + f"\n  ({len(rows)} rows in {results_path.name})"
+        )
+
+    # Schema-union read from the deduped rows (NDJSON reader tolerates
+    # ragged rows — failure rows carry error_type, judge_failed rows
+    # carry judge_error, scored rows neither).
+    buf = io.BytesIO("\n".join(json.dumps(r) for r in rows).encode("utf-8"))
+    df = pl.read_ndjson(buf)
 
     overall = _aggregate_overall(df)
     by_category = _aggregate_by_category(df)
     metadata = _extract_metadata(df, results_path)
+    metadata["publication_safe"] = safe
+    metadata["safety_problems"] = problems
+    metadata["coverage_table"] = _coverage_report(rows)
+    metadata["run_metadata"] = load_metadata(results_path)
 
     _write_markdown_summary(
         overall=overall,
         by_category=by_category,
+        metadata=metadata,
         out=output_dir / "results-summary.md",
     )
     _write_combined_html(
@@ -93,19 +199,29 @@ def _aggregate_overall(df: pl.DataFrame) -> pl.DataFrame:
         .group_by("system")
         .agg(pl.col("score").mean().alias("mean_score_excl_adversarial"))
     )
+    aggs = [
+        pl.col("score").mean().alias("mean_score"),
+        pl.col("score").count().alias("n_scored"),
+        pl.len().alias("n_total"),
+        pl.col("answer_input_tokens").sum().alias("total_input_tokens"),
+        pl.col("answer_output_tokens").sum().alias("total_output_tokens"),
+        pl.col("internal_input_tokens").sum().alias("internal_input_tokens"),
+        pl.col("internal_output_tokens").sum().alias("internal_output_tokens"),
+        pl.col("elapsed_ms").median().alias("median_elapsed_ms"),
+        pl.col("elapsed_ms").quantile(0.95).alias("p95_elapsed_ms"),
+    ]
+    # Context-size columns are new (added with the publication-safety
+    # work); guard so older JSONL without them still renders. Mean over
+    # non-null so failure rows (null context) don't drag it to zero.
+    if "retrieved_context_chars" in df.columns:
+        aggs.append(pl.col("retrieved_context_chars").mean().alias("avg_ctx_chars"))
+    if "retrieved_context_tokens_estimate" in df.columns:
+        aggs.append(pl.col("retrieved_context_tokens_estimate").mean().alias("avg_ctx_tokens_est"))
+    if "retrieved_items_count" in df.columns:
+        aggs.append(pl.col("retrieved_items_count").mean().alias("avg_ctx_items"))
     return (
         df.group_by("system")
-        .agg(
-            pl.col("score").mean().alias("mean_score"),
-            pl.col("score").count().alias("n_scored"),
-            pl.len().alias("n_total"),
-            pl.col("answer_input_tokens").sum().alias("total_input_tokens"),
-            pl.col("answer_output_tokens").sum().alias("total_output_tokens"),
-            pl.col("internal_input_tokens").sum().alias("internal_input_tokens"),
-            pl.col("internal_output_tokens").sum().alias("internal_output_tokens"),
-            pl.col("elapsed_ms").median().alias("median_elapsed_ms"),
-            pl.col("elapsed_ms").quantile(0.95).alias("p95_elapsed_ms"),
-        )
+        .agg(*aggs)
         .join(excl_mean, on="system", how="left")
         .sort("mean_score", descending=True, nulls_last=True)
     )
@@ -143,25 +259,76 @@ def _write_markdown_summary(
     *,
     overall: pl.DataFrame,
     by_category: pl.DataFrame,
+    metadata: dict[str, object],
     out: Path,
 ) -> None:
+    safe = bool(metadata.get("publication_safe"))
+    _p = metadata.get("safety_problems")
+    problems: list[str] = [str(x) for x in _p] if isinstance(_p, list) else []
     lines: list[str] = ["# LoCoMo benchmark results", ""]
 
+    if safe:
+        lines += [
+            "> ✅ **Publication-safe:** every system answered the same "
+            "question set and every question was scored.",
+            "",
+        ]
+    else:
+        lines += [
+            "> ⚠️ **NOT PUBLICATION-SAFE — do not publish or rank these "
+            "numbers.** Coverage is incomplete or unequal:",
+            "",
+        ]
+        lines += [f"> - {p}" for p in problems]
+        lines += [
+            "",
+            "> Headline ranking is suppressed. Fix the run (`swb rescore` "
+            "for judge_failed rows; re-run missing systems) then regenerate.",
+            "",
+        ]
+
+    lines += ["## Coverage", ""]
+    lines.append(str(metadata.get("coverage_table", "(coverage unavailable)")))
+    lines += [
+        "",
+        "_Failed = explicit zero-score rows (ingest/answer/timeout/abort). "
+        "Judge-failed = answer produced but judge call failed (score null, "
+        "excluded from means — blocks publication)._",
+        "",
+    ]
+
     lines += ["## Overall", ""]
+    if not safe:
+        lines += [
+            "_Sorted by mean score for inspection only — this is **not** a "
+            "ranking; the run is not publication-safe._",
+            "",
+        ]
+    has_ctx = "avg_ctx_tokens_est" in overall.columns
+    ctx_hdr = " Avg ctx tok | Avg ctx items |" if has_ctx else ""
+    ctx_sep = "---:|---:|" if has_ctx else ""
     lines.append(
         "| System | Mean score | Mean (excl. adv) | n | Avg input tok / q | "
-        "Avg output tok / q | Median latency (s) | p95 latency (s) |"
+        f"Avg output tok / q | Median latency (s) | p95 latency (s) |{ctx_hdr}"
     )
-    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+    lines.append(f"|---|---:|---:|---:|---:|---:|---:|---:|{ctx_sep}")
     for row in overall.iter_rows(named=True):
         n = row["n_scored"] or 1
         mean = row["mean_score"] if row["mean_score"] is not None else 0.0
         mean_excl = row.get("mean_score_excl_adversarial")
         mean_excl_str = f"{mean_excl:.3f}" if isinstance(mean_excl, float) else "—"
+        ctx_cells = ""
+        if has_ctx:
+            ct = row.get("avg_ctx_tokens_est")
+            ci = row.get("avg_ctx_items")
+            ct_s = f"{ct:.0f}" if isinstance(ct, (int, float)) else "—"
+            ci_s = f"{ci:.1f}" if isinstance(ci, (int, float)) else "—"
+            ctx_cells = f" {ct_s} | {ci_s} |"
         lines.append(
             f"| {row['system']} | {mean:.3f} | {mean_excl_str} | {n} | "
             f"{row['total_input_tokens'] / n:.0f} | {row['total_output_tokens'] / n:.0f} | "
             f"{row['median_elapsed_ms'] / 1000:.2f} | {row['p95_elapsed_ms'] / 1000:.2f} |"
+            f"{ctx_cells}"
         )
 
     lines += ["", "## By category", ""]
@@ -182,19 +349,20 @@ def _write_markdown_summary(
 # ── Charts ────────────────────────────────────────────────────────────────
 
 
-def _color_scale() -> alt.Scale:
-    """Shared color scale so the same system gets the same color in
-    every chart. Unknown systems fall through to the default palette."""
-    return alt.Scale(
-        domain=list(SYSTEM_COLORS),
-        range=list(SYSTEM_COLORS.values()),
-    )
+def _color_scale(systems: list[str]) -> alt.Scale:
+    """Neutral, deterministic colour scale (by sorted system name) so
+    the same system gets the same colour in every chart and no vendor
+    is visually privileged."""
+    colors = _system_colors(systems)
+    domain = sorted(colors)
+    return alt.Scale(domain=domain, range=[colors[s] for s in domain])
 
 
 def _overall_chart_spec(overall: pl.DataFrame) -> dict[str, object]:
-    """Horizontal-bar overall ranking, sorted descending by score.
+    """Horizontal-bar overall chart, sorted descending by score.
     Returns the Vega-Lite spec dict (not an altair Chart) so the
     HTML template can embed it directly."""
+    systems = overall.get_column("system").to_list()
     chart = (
         alt.Chart(overall)
         .mark_bar(cornerRadiusEnd=4, height=28)
@@ -211,7 +379,7 @@ def _overall_chart_spec(overall: pl.DataFrame) -> dict[str, object]:
                 axis=alt.Axis(format=".0%", labelFontSize=12, titleFontSize=12, grid=True),
                 scale=alt.Scale(domain=[0, 1]),
             ),
-            color=alt.Color("system:N", scale=_color_scale(), legend=None),
+            color=alt.Color("system:N", scale=_color_scale(systems), legend=None),
             tooltip=[
                 alt.Tooltip("system:N", title="System"),
                 alt.Tooltip("mean_score:Q", title="Mean score", format=".3f"),
@@ -237,6 +405,7 @@ def _overall_chart_spec(overall: pl.DataFrame) -> dict[str, object]:
 def _by_category_chart_spec(by_category: pl.DataFrame) -> dict[str, object]:
     """Grouped bar chart per category. Same color encoding as the
     overall chart so the eye tracks each system across both."""
+    systems = by_category.get_column("system").unique().to_list()
     chart = (
         alt.Chart(by_category)
         .mark_bar(cornerRadiusEnd=3)
@@ -254,7 +423,7 @@ def _by_category_chart_spec(by_category: pl.DataFrame) -> dict[str, object]:
             ),
             color=alt.Color(
                 "system:N",
-                scale=_color_scale(),
+                scale=_color_scale(systems),
                 legend=alt.Legend(title=None, orient="bottom", labelFontSize=13, symbolSize=180),
             ),
             column=alt.Column(
@@ -429,6 +598,25 @@ _HTML_TEMPLATE = """<!doctype html>
   }}
   footer a {{ color: var(--accent); text-decoration: none; }}
   footer a:hover {{ text-decoration: underline; }}
+  .banner {{
+    margin: 24px 0 0;
+    padding: 14px 18px;
+    border-radius: var(--radius);
+    font-size: 14px;
+    border: 1px solid var(--border);
+  }}
+  .banner.ok {{ background: #ecfdf5; color: #065f46; border-color: #a7f3d0; }}
+  .banner.warn {{ background: #fef2f2; color: #991b1b; border-color: #fecaca; }}
+  .banner ul {{ margin: 8px 0 4px 18px; padding: 0; }}
+  pre.coverage {{
+    overflow-x: auto;
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    font-size: 12.5px;
+    line-height: 1.5;
+  }}
 </style>
 </head>
 <body>
@@ -437,6 +625,7 @@ _HTML_TEMPLATE = """<!doctype html>
     <div class="eyebrow">statewave-bench</div>
     <h1>LoCoMo benchmark results</h1>
     <p class="lede">{lede}</p>
+    {safety_banner}
     <dl class="meta">
       <div><dt>Conversations</dt><dd>{n_conversations}</dd></div>
       <div><dt>Systems</dt><dd>{n_systems}</dd></div>
@@ -445,11 +634,24 @@ _HTML_TEMPLATE = """<!doctype html>
       <div><dt>Source</dt><dd>{results_path}</dd></div>
       <div><dt>Generated</dt><dd>{generated_at}</dd></div>
     </dl>
+    <p class="section-lede" style="margin-top:12px">Run config{meta_extra}</p>
   </header>
 
   <section>
-    <h2>Overall ranking</h2>
-    <p class="section-lede">Mean score across all categories. Higher is better.</p>
+    <h2>Coverage</h2>
+    <p class="section-lede">
+      Per-system completeness audit. A number is only trustworthy if every
+      system answered the same question set and every question was scored.
+      Failed = explicit zero-score rows; judge-failed = answer produced but
+      the judge call failed (score null, blocks publication).
+    </p>
+    <div class="card"><pre class="coverage">{coverage_html}</pre></div>
+  </section>
+
+  <section>
+    <h2>Overall (mean score across categories)</h2>
+    <p class="section-lede">Higher is better. Order is by score; it is a
+      ranking only when the run is publication-safe (see banner above).</p>
     <div class="card"><div id="overall" class="chart-host"></div></div>
   </section>
 
@@ -477,6 +679,7 @@ _HTML_TEMPLATE = """<!doctype html>
             <th class="num">Scored</th>
             <th class="num">Input tok / q</th>
             <th class="num">Output tok / q</th>
+            {ctx_header}
             <th class="num">p50 latency</th>
             <th class="num">p95 latency</th>
           </tr>
@@ -514,21 +717,48 @@ def _write_combined_html(
     metadata: dict[str, object],
     out: Path,
 ) -> None:
-    leader_row = overall.row(0, named=True) if overall.height else None
-    if leader_row and leader_row.get("mean_score") is not None:
+    safe = bool(metadata.get("publication_safe"))
+    _p = metadata.get("safety_problems")
+    problems: list[str] = [str(x) for x in _p] if isinstance(_p, list) else []
+
+    # A "leader" is only stated when the run is publication-safe. An
+    # unsafe run gets a neutral, non-ranking lede.
+    if safe and overall.height and overall.row(0, named=True).get("mean_score") is not None:
+        leader_row = overall.row(0, named=True)
         lede = (
-            f"<strong>{leader_row['system']}</strong> leads with a mean score of "
-            f"<strong>{leader_row['mean_score']:.3f}</strong> across "
-            f"{metadata['n_questions']} question-runs."
+            f"{metadata['n_questions']} question-runs across "
+            f"{metadata['n_systems']} systems. Highest mean score: "
+            f"{leader_row['system']} ({leader_row['mean_score']:.3f})."
         )
     else:
         lede = f"{metadata['n_questions']} question-runs across {metadata['n_systems']} systems."
 
+    if safe:
+        safety_banner = (
+            '<div class="banner ok">✅ Publication-safe: every system '
+            "answered the same question set and every question was scored.</div>"
+        )
+    else:
+        items = "".join(f"<li>{p}</li>" for p in problems)
+        safety_banner = (
+            '<div class="banner warn"><strong>⚠️ NOT PUBLICATION-SAFE — '
+            "do not publish or rank these numbers.</strong> Coverage is "
+            f"incomplete or unequal:<ul>{items}</ul>"
+            "Sorted by score for inspection only; this is not a ranking.</div>"
+        )
+
+    colors = _system_colors(overall.get_column("system").to_list())
+    has_ctx = "avg_ctx_tokens_est" in overall.columns
     table_rows: list[str] = []
     for row in overall.iter_rows(named=True):
         n = row["n_scored"] or 1
-        color = SYSTEM_COLORS.get(row["system"], "#9ca3af")
+        color = colors.get(row["system"], "#999999")
         mean_text = f"{row['mean_score']:.3f}" if row["mean_score"] is not None else "—"
+        ctx_cell = ""
+        if has_ctx:
+            ct = row.get("avg_ctx_tokens_est")
+            ct_s = f"{ct:.0f}" if isinstance(ct, (int, float)) else "—"
+            ctx_cell = f'<td class="num">{ct_s}</td>'
         table_rows.append(
             "<tr>"
             f'<td><span class="system-dot" style="background:{color}"></span>'
@@ -537,6 +767,7 @@ def _write_combined_html(
             f'<td class="num">{row["n_scored"]}</td>'
             f'<td class="num">{row["total_input_tokens"] / n:.0f}</td>'
             f'<td class="num">{row["total_output_tokens"] / n:.0f}</td>'
+            f"{ctx_cell}"
             f'<td class="num">{row["median_elapsed_ms"] / 1000:.2f} s</td>'
             f'<td class="num">{row["p95_elapsed_ms"] / 1000:.2f} s</td>'
             "</tr>"
@@ -548,9 +779,24 @@ def _write_combined_html(
         if isinstance(answer_models, list) and answer_models
         else "(none)"
     )
+    ctx_header = '<th class="num">Avg ctx tok</th>' if has_ctx else ""
+
+    rm = metadata.get("run_metadata") or {}
+    if isinstance(rm, dict) and rm:
+        meta_extra = (
+            f" · mode {rm.get('bench_mode', '?')} · scoring "
+            f"{rm.get('scoring_mode', '?')} · judge {rm.get('judge_model', '?')}"
+            f" · commit {str(rm.get('git_commit') or '?')[:10]}"
+        )
+    else:
+        meta_extra = " · run metadata: (none — predates metadata capture)"
 
     html = _HTML_TEMPLATE.format(
         lede=lede,
+        safety_banner=safety_banner,
+        coverage_html=str(metadata.get("coverage_table", "")),
+        meta_extra=meta_extra,
+        ctx_header=ctx_header,
         n_conversations=metadata["n_conversations"],
         n_systems=metadata["n_systems"],
         n_questions=metadata["n_questions"],
