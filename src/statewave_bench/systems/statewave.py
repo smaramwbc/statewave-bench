@@ -47,6 +47,21 @@ EPISODE_TYPE = "conversation"
 # improving recall on this dataset.
 DEFAULT_CONTEXT_MAX_TOKENS = 2048
 
+
+def _resolve_context_max_tokens() -> int:
+    """Context-bundle token budget. Override via
+    `SWB_STATEWAVE_CONTEXT_MAX_TOKENS` for equal-budget cross-system
+    experiments (e.g. matching the ~6,900 tok/query Mem0 reports for
+    its published LoCoMo number). Default keeps the tuned 2K bundle."""
+    raw = os.environ.get("SWB_STATEWAVE_CONTEXT_MAX_TOKENS")
+    if not raw:
+        return DEFAULT_CONTEXT_MAX_TOKENS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_CONTEXT_MAX_TOKENS
+
+
 # Per-conversation compile uses the wait-for-completion path so the
 # bench's `answer` calls always run against fully-compiled memory.
 #
@@ -326,7 +341,7 @@ class StatewaveSystem(MemorySystem):
             bundle = self._client.get_context(
                 subject_id,
                 task=question,
-                max_tokens=DEFAULT_CONTEXT_MAX_TOKENS,
+                max_tokens=_resolve_context_max_tokens(),
             )
             context = bundle.assembled_context
 

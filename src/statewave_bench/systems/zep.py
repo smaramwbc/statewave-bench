@@ -187,6 +187,35 @@ ZEP_GRAPH_SETTLE_TIMEOUT_SEC = 900.0
 ZEP_SEARCH_LIMIT = 20
 ZEP_SEARCH_MAX_CHARS = 8192
 ZEP_SEARCH_RERANKER = "mmr"
+
+
+def _resolve_zep_search_limit() -> int:
+    """Edge-count cap for `graph.search`. Override via
+    `SWB_ZEP_SEARCH_LIMIT` for equal-budget experiments — the count
+    cap must be raised alongside the char budget or it bottlenecks
+    the context well below the target token count."""
+    raw = os.environ.get("SWB_ZEP_SEARCH_LIMIT")
+    if not raw:
+        return ZEP_SEARCH_LIMIT
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return ZEP_SEARCH_LIMIT
+
+
+def _resolve_zep_search_max_chars() -> int:
+    """Char budget for `graph.search` (~4 chars/token). Override via
+    `SWB_ZEP_SEARCH_MAX_CHARS` to match a target token budget across
+    systems (e.g. ~27,600 chars ≈ ~6,900 tokens)."""
+    raw = os.environ.get("SWB_ZEP_SEARCH_MAX_CHARS")
+    if not raw:
+        return ZEP_SEARCH_MAX_CHARS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return ZEP_SEARCH_MAX_CHARS
+
+
 ZEP_SEARCH_MMR_LAMBDA = 0.5
 
 
@@ -438,8 +467,8 @@ class ZepSystem(MemorySystem):
             query=question,
             user_id=user_id,
             scope="edges",
-            limit=ZEP_SEARCH_LIMIT,
-            max_characters=ZEP_SEARCH_MAX_CHARS,
+            limit=_resolve_zep_search_limit(),
+            max_characters=_resolve_zep_search_max_chars(),
             reranker=ZEP_SEARCH_RERANKER,
             mmr_lambda=ZEP_SEARCH_MMR_LAMBDA,
         )

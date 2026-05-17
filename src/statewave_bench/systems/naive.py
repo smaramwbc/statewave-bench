@@ -19,6 +19,7 @@ take on the complexity of a memory runtime.
 
 from __future__ import annotations
 
+import os
 import time
 from collections import defaultdict, deque
 
@@ -33,10 +34,26 @@ from .base import AnswerResult, HealthResult, MemorySystem
 DEFAULT_WINDOW_SIZE = 100
 
 
+def _resolve_window_size() -> int:
+    """Rolling-window turn count. Override via `SWB_NAIVE_WINDOW_SIZE`
+    for equal-budget cross-system experiments — raising the window is
+    how the naive baseline's context budget is matched to a target
+    token count (≈140 turns ≈ ~6,900 tokens on LoCoMo)."""
+    raw = os.environ.get("SWB_NAIVE_WINDOW_SIZE")
+    if not raw:
+        return DEFAULT_WINDOW_SIZE
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_WINDOW_SIZE
+
+
 class NaiveSystem(MemorySystem):
     name = "naive"
 
-    def __init__(self, window_size: int = DEFAULT_WINDOW_SIZE) -> None:
+    def __init__(self, window_size: int | None = None) -> None:
+        if window_size is None:
+            window_size = _resolve_window_size()
         self._llm = LlmClient()
         self._window_size = window_size
         # Per-conversation rolling window. We index by `conversation.id`
