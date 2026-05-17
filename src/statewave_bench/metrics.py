@@ -341,12 +341,19 @@ def score_answer(
         multi_hop/temporal/open_*, refusal-judge for adversarial. Our
         canonical methodology — defensible and slightly under-reports
         relative to lenient SOTA harnesses.
-      - `permissive`: LLM-judges EVERY category (including single_hop
-        and adversarial against an empty truth) with a generous prompt
-        that accepts paraphrase, partial-overlap, hedged answers, and
-        format variation. This matches the LongMem / public-SOTA
-        scoring pattern. Use for apples-to-apples comparison against
-        Mem0 91.6% / Honcho 89.9% / Backboard 90.1% / Memori 82%.
+      - `permissive`: the generous LongMem/public-SOTA LLM-judge prompt
+        for single_hop AND the LLM_JUDGE_CATEGORIES (it accepts
+        paraphrase, partial overlap, hedged answers, and format
+        variation). Use for apples-to-apples comparison against Mem0
+        91.6% / Honcho 89.9% / Backboard 90.1% / Memori 82%.
+
+    Adversarial is the exception to both modes: it is ALWAYS scored by
+    the refusal judge (its ground truth is empty — F1 and the
+    equivalence judge are both meaningless against it), regardless of
+    strict/permissive. The mode only changes how the non-adversarial
+    categories are judged. Public-SOTA harnesses drop adversarial
+    entirely; the report surfaces an adversarial-excluded mean for that
+    apples-to-apples comparison.
     """
     mode = os.environ.get("SWB_SCORING_MODE", "strict").lower()
     permissive = mode == "permissive"

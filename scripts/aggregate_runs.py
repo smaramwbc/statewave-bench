@@ -46,6 +46,51 @@ def _load(path: Path) -> list[dict[str, object]]:
     return rows
 
 
+def _keyset_by_system(rows: list[dict[str, object]]) -> dict[str, set[tuple[str, int]]]:
+    out: dict[str, set[tuple[str, int]]] = defaultdict(set)
+    for r in rows:
+        out[str(r["system"])].add((str(r["conversation_id"]), int(r["question_idx"])))  # type: ignore[arg-type]
+    return out
+
+
+def _validate(paths: list[Path], per_run_rows: list[list[dict[str, object]]]) -> list[str]:
+    """Refuse-to-rank conditions: a run where systems answered unequal
+    question sets, incomplete (judge_failed/null) rows, or runs that
+    don't share the same expected question set. Returns problem strings;
+    empty ⇒ aggregation is publication-safe."""
+    problems: list[str] = []
+    run_expected: list[set[tuple[str, int]]] = []
+    for path, rows in zip(paths, per_run_rows, strict=True):
+        bysys = _keyset_by_system(rows)
+        expected = set().union(*bysys.values()) if bysys else set()
+        run_expected.append(expected)
+        for system, keys in sorted(bysys.items()):
+            if keys != expected:
+                problems.append(
+                    f"{path.name}: system '{system}' answered "
+                    f"{len(keys)}/{len(expected)} of the expected questions "
+                    "(unequal set within the run)"
+                )
+        incomplete = sum(
+            1 for r in rows if r.get("metric") == "judge_failed" or r.get("score") is None
+        )
+        if incomplete:
+            problems.append(
+                f"{path.name}: {incomplete} judge_failed/null-score row(s) "
+                "(run `swb rescore` before aggregating)"
+            )
+    if len(run_expected) > 1:
+        base = run_expected[0]
+        for path, exp in zip(paths[1:], run_expected[1:], strict=True):
+            if exp != base:
+                problems.append(
+                    f"{path.name}: expected question set differs from "
+                    f"{paths[0].name} ({len(exp)} vs {len(base)} questions) — "
+                    "runs must cover the same dataset scope to aggregate"
+                )
+    return problems
+
+
 def _run_scores(rows: list[dict[str, object]]) -> dict[str, dict[str, float]]:
     """Per-system {overall, excl_adv, <category>...} means for one run.
 
@@ -80,6 +125,16 @@ def _fmt(x: float) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("runs", nargs="+", type=Path, help="One JSONL per run (>=1).")
+    ap.add_argument(
+        "--allow-incomplete",
+        action="store_true",
+        help=(
+            "Aggregate even when runs are not publication-safe (unequal "
+            "question sets within/across runs, or judge_failed/null rows). "
+            "Default: refuse with a clear error. When set, the output is "
+            "loudly stamped NOT PUBLICATION-SAFE."
+        ),
+    )
     args = ap.parse_args()
 
     paths = sorted(args.runs)
@@ -88,11 +143,37 @@ def main() -> int:
         print(f"ERROR: missing run file(s): {', '.join(map(str, missing))}", file=sys.stderr)
         return 1
 
-    per_run: list[dict[str, dict[str, float]]] = []
+    per_run_rows: list[list[dict[str, object]]] = []
     for p in paths:
         try:
-            per_run.append(_run_scores(_load(p)))
-        except (json.JSONDecodeError, KeyError) as e:
+            per_run_rows.append(_load(p))
+        except json.JSONDecodeError as e:
+            print(f"ERROR: {p} unparseable: {e}", file=sys.stderr)
+            return 1
+
+    problems = _validate(paths, per_run_rows)
+    if problems and not args.allow_incomplete:
+        print(
+            "ERROR: refusing to aggregate — these runs are not "
+            "publication-safe:\n"
+            + "\n".join(f"  - {p}" for p in problems)
+            + "\n\nFix the runs (re-run missing systems; `swb rescore` for "
+            "judge_failed rows) or pass --allow-incomplete to aggregate "
+            "anyway (output will be stamped NOT PUBLICATION-SAFE).",
+            file=sys.stderr,
+        )
+        return 1
+    if problems:
+        print("⚠️  NOT PUBLICATION-SAFE — aggregating incomplete/unequal runs:")
+        for p in problems:
+            print(f"  - {p}")
+        print()
+
+    per_run: list[dict[str, dict[str, float]]] = []
+    for p, rows in zip(paths, per_run_rows, strict=True):
+        try:
+            per_run.append(_run_scores(rows))
+        except KeyError as e:
             print(f"ERROR: {p} unparseable: {e}", file=sys.stderr)
             return 1
 

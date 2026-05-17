@@ -35,7 +35,8 @@ from rich.progress import (
 )
 
 from .dataset import LocomoConversation, LocomoQA
-from .llm import LlmClient, resolve_judge_model
+from .llm import LlmClient, resolve_answer_model, resolve_judge_model
+from .metadata import build_metadata, write_metadata
 from .metrics import JudgeQuotaExhausted, Score, score_answer
 from .systems.base import AnswerResult, MemorySystem
 
@@ -57,6 +58,33 @@ FAILURE_STREAK_THRESHOLD = 8
 
 
 # ── Result records ────────────────────────────────────────────────────────
+
+
+# Documented token approximation. Exact per-model tokenization isn't
+# available here without pulling every vendor's tokenizer; ~4 chars per
+# token is the standard rough estimate and is applied identically to
+# every system so the comparison stays fair. The chars count is exact.
+_CHARS_PER_TOKEN_ESTIMATE = 4
+
+
+def _context_size(answer: AnswerResult) -> dict[str, Any]:
+    """Per-row context-size fields so a reader can see whether one
+    system had far more context than another at the same nominal
+    budget. `retrieved_context` is the joined string the answer model
+    saw; chars is exact, tokens is the documented ~4-chars/token
+    approximation applied uniformly."""
+    ctx = answer.retrieved_context
+    if ctx is None:
+        chars: int | None = None
+        tok_est: int | None = None
+    else:
+        chars = len(ctx)
+        tok_est = chars // _CHARS_PER_TOKEN_ESTIMATE
+    return {
+        "retrieved_context_chars": chars,
+        "retrieved_context_tokens_estimate": tok_est,
+        "retrieved_items_count": answer.retrieved_items_count,
+    }
 
 
 def _result_record(
@@ -86,6 +114,47 @@ def _result_record(
         "answer_output_tokens": answer.answer_output_tokens,
         "internal_input_tokens": answer.internal_input_tokens,
         "internal_output_tokens": answer.internal_output_tokens,
+        **_context_size(answer),
+    }
+
+
+def _result_record_failed(
+    *,
+    system: str,
+    conversation_id: str,
+    question_idx: int,
+    qa: LocomoQA,
+    error_type: str,
+    error_message: str,
+) -> dict[str, Any]:
+    """JSONL row for an item that never produced an answer — ingest
+    failed, retrieval/answer raised, timed out, or the conversation was
+    aborted by the failure circuit-breaker. Score is 0.0 (a crash is a
+    wrong answer, NOT removed from the denominator) and `metric` is
+    "system_failed" so the report can count it as failed-but-present.
+    Writing this row is what stops failed questions silently vanishing
+    from coverage."""
+    return {
+        "system": system,
+        "conversation_id": conversation_id,
+        "question_idx": question_idx,
+        "question": qa.question,
+        "category": qa.category,
+        "ground_truth": qa.answer,
+        "prediction": "",
+        "score": 0.0,
+        "metric": "system_failed",
+        "error_type": error_type,
+        "error_message": error_message,
+        "elapsed_ms": 0.0,
+        "answer_model": None,
+        "answer_input_tokens": 0,
+        "answer_output_tokens": 0,
+        "internal_input_tokens": 0,
+        "internal_output_tokens": 0,
+        "retrieved_context_chars": None,
+        "retrieved_context_tokens_estimate": None,
+        "retrieved_items_count": None,
     }
 
 
@@ -135,9 +204,17 @@ def _short(err: BaseException) -> str:
 # ── Resumability ──────────────────────────────────────────────────────────
 
 
-def _load_completed_keys(path: Path) -> set[tuple[str, str, int]]:
+def _load_completed_keys(
+    path: Path, *, keep_judge_failed: bool = False
+) -> set[tuple[str, str, int]]:
     """Read prior result rows and return the set of (system, conv_id,
-    question_idx) tuples already done. Skipped on next run."""
+    question_idx) tuples already done — skipped on the next run.
+
+    A `judge_failed` / null-score row is NOT "done": the answer is in
+    hand but it was never scored, so on `--resume` we re-attempt it
+    (answer + judge) by default. Pass `keep_judge_failed=True` to treat
+    those rows as final and skip them (use `swb rescore` to retry only
+    the judge without re-spending on the answer model)."""
     if not path.exists():
         return set()
     completed: set[tuple[str, str, int]] = set()
@@ -147,6 +224,9 @@ def _load_completed_keys(path: Path) -> set[tuple[str, str, int]]:
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue  # skip malformed rows; partial-write tolerance
+            incomplete = row.get("metric") == "judge_failed" or row.get("score") is None
+            if incomplete and not keep_judge_failed:
+                continue
             completed.add((row["system"], row["conversation_id"], row["question_idx"]))
     return completed
 
@@ -160,22 +240,46 @@ def run_bench(
     conversations: Iterable[LocomoConversation],
     output_path: Path,
     llm: LlmClient | None = None,
+    keep_judge_failed: bool = False,
+    bench_mode: str = "vendor_defaults",
+    dataset_url: str | None = None,
+    dataset_cache_path: str | None = None,
 ) -> None:
-    """Execute the bench. Streams results to `output_path` (JSONL)
-    as it goes, skipping any (system, conv_id, question_idx) tuples
-    already present in the file."""
+    """Execute the bench. Streams results to `output_path` (JSONL) as
+    it goes, skipping (system, conv_id, question_idx) tuples already
+    present. Every attempted item produces a row — successes, judge
+    failures, and hard failures alike — so nothing can silently
+    disappear from coverage. Writes a `<stem>.metadata.json` sidecar
+    capturing the exact config behind the numbers."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    already_done = _load_completed_keys(output_path)
+    already_done = _load_completed_keys(output_path, keep_judge_failed=keep_judge_failed)
 
     judge_llm = llm or LlmClient()
     judge_model = resolve_judge_model()
+    answer_model = resolve_answer_model()
 
     # We materialize the conversation list so the progress bar has
     # an accurate total. LoCoMo is small (~600 entries); the memory
     # cost is fine.
     convs = list(conversations)
     total_questions = sum(len(c.qa) for c in convs) * len(systems)
+
+    # Metadata sidecar — written before any work so a killed run still
+    # leaves an auditable record of what config it was launched with.
+    metadata = build_metadata(
+        results_path=output_path,
+        systems=[s.name for s in systems],
+        n_conversations=len(convs),
+        n_questions=sum(len(c.qa) for c in convs),
+        answer_model=answer_model,
+        judge_model=judge_model,
+        bench_mode=bench_mode,
+        dataset_url=dataset_url or "(unspecified)",
+        dataset_cache_path=dataset_cache_path,
+    )
+    meta_path = write_metadata(output_path, metadata)
+    console.print(f"[dim]Run metadata → {meta_path}[/]")
 
     # Per-system resume breakdown: thin "23 rows already" messages
     # let stale-state bugs (IDE buffer overwriting the JSONL, an old
@@ -223,6 +327,27 @@ def run_bench(
             stage="starting",
         )
 
+        def _emit_failed(
+            system_name: str,
+            conv_id: str,
+            q_idx: int,
+            qa: LocomoQA,
+            error_type: str,
+            error_message: str,
+        ) -> None:
+            """Write an explicit zero-score failure row so the item
+            stays in the denominator instead of vanishing."""
+            row = _result_record_failed(
+                system=system_name,
+                conversation_id=conv_id,
+                question_idx=q_idx,
+                qa=qa,
+                error_type=error_type,
+                error_message=error_message,
+            )
+            out_fh.write(json.dumps(row) + "\n")
+            out_fh.flush()
+
         for conv in convs:
             for system in systems:
                 stage = f"{system.name} / {conv.id} (ingest)"
@@ -234,18 +359,30 @@ def run_bench(
                     1 for i in range(len(conv.qa)) if (system.name, conv.id, i) in already_done
                 )
                 if conv_questions_done < len(conv.qa):
+                    ingest_error: tuple[str, str] | None = None
                     try:
                         system.ingest(conv)
                     except NotImplementedError as e:
                         console.print(f"[red]System {system.name} ingest not implemented:[/] {e}")
-                        progress.update(task, advance=len(conv.qa))
-                        continue
+                        ingest_error = ("system_error", _short(e))
                     except Exception as e:
                         console.print(
                             f"[red]System {system.name} ingest failed for "
                             f"conversation {conv.id}:[/] {e}"
                         )
-                        progress.update(task, advance=len(conv.qa))
+                        ingest_error = ("ingest_failed", _short(e))
+                    if ingest_error is not None:
+                        # Ingest is the gate for every question of this
+                        # (system, conv). Don't silently skip them —
+                        # write an explicit failure row for each one
+                        # still owed, so coverage shows the gap instead
+                        # of the denominator quietly shrinking.
+                        etype, emsg = ingest_error
+                        for q_idx, qa in enumerate(conv.qa):
+                            if (system.name, conv.id, q_idx) in already_done:
+                                continue
+                            _emit_failed(system.name, conv.id, q_idx, qa, etype, emsg)
+                            progress.update(task, advance=1)
                         continue
 
                 # Per-question loop. The failure streak counter resets
@@ -260,20 +397,28 @@ def run_bench(
                         progress.update(task, advance=1)
                         continue
                     if failure_streak >= FAILURE_STREAK_THRESHOLD:
-                        # Skip the rest of this conversation for this
-                        # system. The runner already logged the
-                        # individual failures via _run_one_question;
-                        # surface the abort once here so the operator
-                        # sees the circuit-breaker fired without
-                        # scrolling through 200 identical errors.
+                        # Circuit-breaker: stop *calling* the dead system
+                        # for the rest of this conversation, but still
+                        # write an explicit failure row for every
+                        # remaining question so the abort is visible in
+                        # coverage rather than shrinking the denominator.
                         if not aborted_for_streak:
                             console.print(
                                 f"[red]Aborting {system.name} / {conv.id}[/] "
                                 f"after {FAILURE_STREAK_THRESHOLD} consecutive "
-                                f"answer failures — skipping remaining "
-                                f"{len(conv.qa) - q_idx} questions for this pair."
+                                f"answer failures — remaining "
+                                f"{len(conv.qa) - q_idx} questions recorded as failed."
                             )
                             aborted_for_streak = True
+                        _emit_failed(
+                            system.name,
+                            conv.id,
+                            q_idx,
+                            qa,
+                            "system_error",
+                            f"aborted after {FAILURE_STREAK_THRESHOLD} consecutive "
+                            "answer failures (circuit-breaker)",
+                        )
                         progress.update(task, advance=1)
                         continue
                     progress.update(
@@ -301,17 +446,19 @@ def run_bench(
                         )
                         progress.update(task, stage="halted (judge quota)")
                         return
-                    if record is None:
+                    # Every question now produces a row (success,
+                    # judge_failed, or system_failed) — nothing is
+                    # dropped. The circuit-breaker counts only hard
+                    # answer failures: a system_failed row means the
+                    # answer call itself died; anything else (including
+                    # judge_failed — the answer model is healthy, only
+                    # the judge was flaky) resets the streak.
+                    if record.get("metric") == "system_failed":
                         failure_streak += 1
                     else:
-                        # Any complete-row write resets the breaker — even
-                        # rows where only the judge failed (the answer model
-                        # is healthy, which is what the breaker actually
-                        # guards). The runner already retried judge
-                        # transients with backoff inside score_answer.
                         failure_streak = 0
-                        out_fh.write(json.dumps(record) + "\n")
-                        out_fh.flush()
+                    out_fh.write(json.dumps(record) + "\n")
+                    out_fh.flush()
                     progress.update(task, advance=1)
 
         progress.update(task, stage="done")
@@ -325,26 +472,25 @@ def _run_one_question(
     qa: LocomoQA,
     judge_llm: LlmClient,
     judge_model: str,
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     """Ask one question, score the answer, return a JSONL row.
 
-    Three outcomes:
-      - Answer + score both succeed: returns a complete row.
-      - Answer succeeds, scoring fails (transient judge errors that
-        survived the retry path): returns a row with `score: null`,
-        `metric: "judge_failed"`, and a `judge_error` field. The row
-        IS written to the JSONL; `swb rescore` can retry the judge
-        later without re-running the answer phase. The failure-streak
-        circuit-breaker does NOT count this as a failure — the answer
-        model is healthy, only the judge is flaky.
-      - Answer fails: returns None. The runner increments the
-        failure-streak counter; 3 in a row aborts the conversation
-        for that system.
+    Always returns a row — never None — so no attempted item can
+    silently drop out of coverage. Outcomes:
+      - Answer + score succeed: a complete scored row.
+      - Answer succeeds, judge fails (transient that survived retries):
+        a row with `score: null`, `metric: "judge_failed"`, and a
+        `judge_error` field; `swb rescore` can retry the judge without
+        re-spending on the answer model. The circuit-breaker does NOT
+        count this — the answer model is healthy, only the judge flaked.
+      - Answer fails (timeout / not implemented / any error): an
+        explicit zero-score row with `metric: "system_failed"` and an
+        `error_type`/`error_message`. The runner counts this toward the
+        failure streak.
 
-    Judge-quota exhaustion (insufficient_quota / credit balance is
-    too low) propagates as `JudgeQuotaExhausted`; the runner catches
-    it at the top level and halts the whole bench so the operator
-    can refill before more answer-model spend is wasted.
+    Judge-quota exhaustion propagates as `JudgeQuotaExhausted`; the
+    runner catches it at the top level and halts the whole bench so the
+    operator can refill before more answer-model spend is wasted.
     """
     try:
         start = time.perf_counter()
@@ -352,12 +498,38 @@ def _run_one_question(
         del start
     except NotImplementedError as e:
         console.print(f"[yellow]System {system.name} answer not implemented:[/] {e}")
-        return None
+        return _result_record_failed(
+            system=system.name,
+            conversation_id=conv_id,
+            question_idx=q_idx,
+            qa=qa,
+            error_type="system_error",
+            error_message=_short(e),
+        )
+    except TimeoutError as e:
+        console.print(
+            f"[red]System {system.name} answer timed out[/] (conv={conv_id}, q={q_idx}): {e}"
+        )
+        return _result_record_failed(
+            system=system.name,
+            conversation_id=conv_id,
+            question_idx=q_idx,
+            qa=qa,
+            error_type="timeout",
+            error_message=_short(e),
+        )
     except Exception as e:
         console.print(
             f"[red]System {system.name} answer failed[/] (conv={conv_id}, q={q_idx}): {e}"
         )
-        return None
+        return _result_record_failed(
+            system=system.name,
+            conversation_id=conv_id,
+            question_idx=q_idx,
+            qa=qa,
+            error_type="answer_failed",
+            error_message=_short(e),
+        )
 
     try:
         score = score_answer(
