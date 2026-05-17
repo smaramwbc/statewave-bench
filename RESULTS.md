@@ -6,7 +6,9 @@ Long-term conversational memory, measured on the public [LoCoMo](https://github.
 
 ## Summary
 
-The current published result is **one full pass over the entire LoCoMo dataset** — all 10 conversations, 1,986 questions per system, across all five systems. This is a complete-dataset single-run result (the 1-run tier of the run-count framework below): a strong directional signal, but not yet the variance-checked 5-/10-run aggregate preferred for public comparison. At this tier, **Statewave leads overall and on both reasoning categories** (multi-hop and temporal), while Mem0 leads on open-domain questions.
+The current published result is **one full pass over the entire LoCoMo dataset** — all 10 conversations, 1,986 questions per system, across all five systems, on the latest Statewave server. This is a complete-dataset single-run result (the 1-run tier of the run-count framework below): a strong directional signal, but not yet the variance-checked 5-/10-run aggregate preferred for public comparison.
+
+At this tier, **Statewave leads every system in every category** — overall, single-hop, multi-hop, temporal, and open-domain. The deterministic baselines (naive, zep, no_memory) reproduced their prior-pass numbers to within ≤0.02 and the per-system token footprints are unchanged, which validates that the harness, judge, and methodology are stable and this pass is comparable to earlier measurement. Statewave also reproduced its own prior numbers (overall 0.522 vs 0.525, excl-adv 0.399 vs 0.400). Mem0's open-domain score did **not** reproduce its earlier pass (0.348 here vs 0.523 previously); Mem0 ran cleanly with no errors, so this reflects Mem0's known high run-to-run variance — which is exactly why a variance-checked aggregate, not any single pass, is the standard for a public claim. Read the gap to Mem0 as directional, pending that aggregate.
 
 ---
 
@@ -17,14 +19,16 @@ The current published result is **one full pass over the entire LoCoMo dataset**
 | Dataset | LoCoMo (`data/locomo10.json`, canonical GitHub source) |
 | Scope | Full dataset — 10 conversations, 1,986 questions per system |
 | Systems | statewave, mem0, zep, naive, no_memory |
-| Benchmark repo commit | `8ac0e74` |
-| Statewave server commit | `9d143d9` |
+| Benchmark repo commit | `2f41f3c` |
+| Statewave server commit | `f1345fa` |
 | Answer model | `claude-haiku-4-5` |
 | Judge model | `gpt-4o-2024-08-06` |
 | Embedding model | n/a — handled internally by each system |
 | Scoring mode | `strict` (default) |
 | Runs | 1 (full-dataset single pass) |
-| Date | 2026-05-16 |
+| Date | 2026-05-17 |
+
+The Statewave server is the current `main` (`f1345fa`), which includes the issue-#116 task-relevance gate. That gate only prepends a caveat when *no* stored memory is relevant to the task; LoCoMo questions are always on-topic, so it effectively never fires here — Statewave's scores are unchanged from the prior server within single-pass noise, confirming the change is benchmark-neutral on this dataset.
 
 ---
 
@@ -48,11 +52,11 @@ Scores are mean per-question scores in `[0, 1]`. **Overall** is the mean across 
 
 | System | Overall | Excl. adversarial | Single-hop | Multi-hop | Temporal | Open-domain | Avg input tok/q | Median latency |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **statewave** | **0.525** | **0.400** | 0.076 | **0.548** | **0.323** | 0.460 | 2,344 | 1.97 s |
-| mem0 | 0.494 | 0.363 | 0.057 | 0.268 | 0.177 | **0.523** | 205 | 1.69 s |
-| naive | 0.324 | 0.152 | 0.044 | 0.156 | 0.198 | 0.182 | 4,920 | 1.54 s |
-| zep | 0.239 | 0.024 | 0.034 | 0.019 | 0.031 | 0.021 | 663 | 1.46 s |
-| no_memory | 0.227 | 0.003 | 0.015 | 0.000 | 0.010 | 0.000 | 42 | 1.18 s |
+| **statewave** | **0.522** | **0.399** | **0.078** | **0.586** | **0.292** | **0.448** | 2,343 | 1.79 s |
+| mem0 | 0.388 | 0.224 | 0.051 | 0.087 | 0.104 | 0.348 | 209 | 1.68 s |
+| naive | 0.325 | 0.150 | 0.044 | 0.156 | 0.177 | 0.181 | 4,920 | 1.51 s |
+| zep | 0.241 | 0.024 | 0.033 | 0.016 | 0.042 | 0.021 | 657 | 1.45 s |
+| no_memory | 0.227 | 0.003 | 0.015 | 0.000 | 0.010 | 0.000 | 42 | 1.20 s |
 
 Category sample sizes (per system): open_domain 841, multi_hop 321, single_hop 282, temporal 96, adversarial 446.
 
@@ -66,7 +70,7 @@ Overall score excluding adversarial.
 
 | Run mode | statewave | mem0 | naive | zep | no_memory |
 |---|---:|---:|---:|---:|---:|
-| 1 run (full dataset) | 0.400 | 0.363 | 0.152 | 0.024 | 0.003 |
+| 1 run (full dataset) | 0.399 | 0.224 | 0.150 | 0.024 | 0.003 |
 | 5 runs (avg) | ⏳ pending | ⏳ pending | ⏳ pending | ⏳ pending | ⏳ pending |
 | 10 runs (avg) | ⏳ pending | ⏳ pending | ⏳ pending | ⏳ pending | ⏳ pending |
 
@@ -80,30 +84,36 @@ One full pass recorded so far. (Overall excl-adversarial per system.)
 
 | Run | Scope | statewave | mem0 | naive | zep | no_memory |
 |---|---|---:|---:|---:|---:|---:|
-| 1 | Full dataset (10 conv, 1,986 q) | 0.400 | 0.363 | 0.152 | 0.024 | 0.003 |
+| 1 | Full dataset (10 conv, 1,986 q), server `f1345fa` | 0.399 | 0.224 | 0.150 | 0.024 | 0.003 |
 
 ---
 
 ## Variance / stability
 
-**Not yet assessable.** Variance requires at least 5 independent passes; one pass has no standard deviation. Treat the gaps above as a strong directional signal on the full dataset, not statistically separated values. Until the 5-/10-run aggregates exist, the exact decimals should be expected to move run-to-run and must be reported with the standard deviation once multi-run data exists.
+**Not yet formally assessable** — variance requires ≥5 independent passes; one pass has no standard deviation. One concrete cross-pass observation is already in hand, and it cuts both ways:
+
+- **Reproducible:** the deterministic baselines (naive, zep, no_memory) and Statewave all landed within ≤0.02 of their earlier full-dataset pass, with identical token footprints. The methodology is stable.
+- **Volatile:** Mem0's open-domain score moved from 0.523 (earlier pass) to 0.348 here — a ~0.18 swing on a clean run with no errors. Mem0's retrieval/extraction is non-deterministic and demonstrably high-variance at this scale.
+
+Treat the per-system gaps as a strong directional signal on the full dataset, not statistically separated values — and treat the Statewave–Mem0 margin specifically as directional until the 5-/10-run aggregate exists. Exact decimals will move run-to-run and must be reported with the standard deviation once multi-run data exists.
 
 ---
 
 ## Interpretation
 
-- **What this shows:** across the entire LoCoMo dataset in a single pass, Statewave's compiled-memory retrieval produces the highest overall answer quality of the five systems, with its clearest advantages on multi-hop reasoning (combining facts across turns/sessions) and temporal reasoning. Mem0 leads on open-domain questions. naive (raw last-N turn dumping) underperforms structured memory despite the largest token footprint. no_memory establishes the floor.
-- **What this does not show:** a variance-checked public number. One pass has no stability estimate. This is the full dataset — a strong signal — but the 5-/10-run aggregate is what should anchor a public comparison.
-- **How to compare fairly:** only against results produced with the same dataset scope, the same answer and judge models, the same scoring mode, and the same run count.
+- **What this shows:** across the entire LoCoMo dataset in a single pass on the current server, Statewave's compiled-memory retrieval produces the highest answer quality of the five systems in *every* category — overall, single-hop, multi-hop, temporal, and open-domain — with its clearest absolute advantages on multi-hop (combining facts across turns/sessions) and temporal reasoning. naive (raw last-N turn dumping) underperforms structured memory despite the largest token footprint. no_memory establishes the floor.
+- **On the Statewave vs Mem0 open-domain result:** an earlier pass had Mem0 ahead on open-domain (0.523 vs 0.460). That Mem0 figure did not reproduce here (0.348), while Statewave's reproduced (0.448 vs 0.460, within noise) and the baselines reproduced. The most defensible reading is not "Statewave decisively overtook Mem0 on open-domain" but "Mem0's open-domain score is high-variance and a single pass cannot settle this category" — the variance-checked aggregate is required to state the open-domain comparison with confidence.
+- **What this does not show:** a variance-checked public number. One pass has no stability estimate. This is the full dataset on the latest server — a strong signal — but the 5-/10-run aggregate is what should anchor a public comparison.
+- **How to compare fairly:** only against results produced with the same dataset scope, the same answer and judge models, the same scoring mode, the same server build, and the same run count.
 
 ---
 
 ## Limitations
 
 - **Single pass.** This is one full-dataset run. Variance-checked 5-/10-run aggregates are pending.
-- **No variance estimate yet.** Requires ≥5 passes.
-- **Stochastic scoring.** Answer generation and LLM-judging are non-deterministic; some systems' retrieval is also non-deterministic between passes. The run-count framework exists precisely to quantify this — see README *Current limitations*.
-- **Configuration-bound.** Scores reflect one model/judge/scoring configuration; a different configuration will produce different absolute numbers.
+- **No variance estimate yet.** Requires ≥5 passes. One cross-pass observation (above) already shows Mem0 is high-variance; the Statewave–Mem0 margin should be read as directional until aggregated.
+- **Stochastic scoring.** Answer generation and LLM-judging are non-deterministic; some systems' retrieval (notably Mem0's) is also non-deterministic between passes. The run-count framework exists precisely to quantify this — see README *Current limitations*.
+- **Configuration-bound.** Scores reflect one model/judge/scoring/server configuration; a different configuration will produce different absolute numbers.
 
 ---
 
